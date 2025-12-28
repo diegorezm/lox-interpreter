@@ -106,6 +106,7 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "class", .CLASS },
     .{ "else", .ELSE },
     .{ "false", .FALSE },
+    .{ "FALSE", .FALSE },
     .{ "for", .FOR },
     .{ "fn", .FN },
     .{ "if", .IF },
@@ -116,6 +117,7 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "super", .SUPER },
     .{ "this", .THIS },
     .{ "true", .TRUE },
+    .{ "TRUE", .TRUE },
     .{ "var", .VAR },
     .{ "while", .WHILE },
 });
@@ -207,7 +209,7 @@ pub const Scanner = struct {
         }
 
         if (self.peek() == '.' and std.ascii.isDigit(self.peekNext() orelse 0)) {
-            _ = self.advance(); // consume '.'
+            _ = self.advance();
 
             while (std.ascii.isDigit(self.peek() orelse 0)) {
                 _ = self.advance();
@@ -237,13 +239,10 @@ pub const Scanner = struct {
             return self.errorAtCurrent("Unterminated string literal. Expected '\"'.");
         }
 
-        // Consume the closing quote
         _ = self.advance();
 
-        // String value without quotes
         const value = self.source[self.start + 1 .. self.current - 1];
 
-        // Full lexeme including quotes
         const lexeme = try self.alloc.dupe(
             u8,
             self.source[self.start..self.current],
@@ -327,4 +326,30 @@ pub const Scanner = struct {
         self.current += 1;
         return true;
     }
+};
+
+const LiteralExpr = struct {
+    value: Literal,
+};
+
+const BinaryExpr = struct {
+    left: *Expr,
+    operator: Token,
+    right: *Expr,
+};
+
+const UnaryExpr = struct {
+    operator: Token,
+    right: *Expr,
+};
+
+const GroupingExpr = struct {
+    expression: *Expr,
+};
+
+const Expr = union(enum) {
+    Binary: BinaryExpr,
+    Unary: UnaryExpr,
+    Literal: LiteralExpr,
+    Grouping: GroupingExpr,
 };

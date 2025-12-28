@@ -1,4 +1,7 @@
 var language = "lox"
 var test = 1234
-var test2 = 1234.2 or 2
+var test2 = 1234.2
+var b = TRUE
+var b2 = FALSE
+var tn = nil
 print language
