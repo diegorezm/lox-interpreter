@@ -10,8 +10,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const lexer_mod = b.addModule("lexer", .{
-        .root_source_file = b.path("src/lexer.zig"),
+    const syntax_mod = b.addModule("syntax", .{
+        .root_source_file = b.path("src/syntax.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -19,7 +19,7 @@ pub fn build(b: *std.Build) void {
     // Bundle shared imports so we can reuse them
     const shared_imports = [_]std.Build.Module.Import{
         .{ .name = "interpreter", .module = interpreter_mod },
-        .{ .name = "lexer", .module = lexer_mod },
+        .{ .name = "syntax", .module = syntax_mod },
     };
 
     // ------------------------------------------------------------

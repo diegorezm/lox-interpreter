@@ -1,5 +1,5 @@
 const std = @import("std");
-const lexer = @import("lexer");
+const syntax = @import("syntax");
 const debug = std.debug;
 
 pub fn main() !void {
@@ -23,14 +23,19 @@ pub fn main() !void {
         .{ contents.len, filename },
     );
 
-    var l = lexer.Scanner.init(arena.allocator(), contents);
-    try l.parse();
+    var l = syntax.Scanner.init(arena.allocator(), contents);
+    try l.scan();
+
     const tokens = l.getTokens();
 
-    for (tokens.items) |t| {
-        const s = try t.toString(arena.allocator());
-        debug.print("{s}\n", .{s});
-    }
+    var parser = syntax.Parser.init(arena.allocator(), tokens);
+    const expr = try parser.parse();
+
+    var buf: [1024]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&buf);
+    try syntax.printExpr(expr, &stdout.interface);
+
+    try stdout.interface.flush();
 }
 
 fn readFileContent(alloc: std.mem.Allocator, filename: []const u8) ![]u8 {
