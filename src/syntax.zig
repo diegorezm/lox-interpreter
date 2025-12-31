@@ -349,6 +349,33 @@ pub const GroupingExpr = struct {
     expression: *Expr,
 };
 
+pub const Value = union(enum) {
+    number: f64,
+    boolean: bool,
+    string: []const u8,
+    nil,
+};
+
+pub fn valueToString(
+    allocator: std.mem.Allocator,
+    value: Value,
+) ![]u8 {
+    var list = std.ArrayList(u8).init(allocator);
+    defer list.deinit();
+
+    try printValue(value, list.writer());
+    return list.toOwnedSlice();
+}
+
+pub fn printValue(value: Value, writer: anytype) !void {
+    switch (value) {
+        .number => |n| try writer.print("{d}", .{n}),
+        .boolean => |b| try writer.print("{}", .{b}),
+        .string => |s| try writer.print("{s}", .{s}),
+        .nil => try writer.writeAll("nil"),
+    }
+}
+
 pub const Expr = union(enum) {
     Binary: BinaryExpr,
     Unary: UnaryExpr,
@@ -640,5 +667,176 @@ pub const Parser = struct {
                 .{ token.line, token.lexeme, message },
             );
         }
+    }
+};
+
+pub const Interpreter = struct {
+    alloc: std.mem.Allocator,
+    pub fn init(alloc: std.mem.Allocator) Interpreter {
+        return .{ .alloc = alloc };
+    }
+
+    pub fn interpret(self: *Interpreter, expr: *Expr) Value {
+        return self.eval(expr);
+    }
+
+    fn eval(self: *Interpreter, expr: *Expr) Value {
+        return switch (expr.*) {
+            .Literal => |lit| self.literalExpr(lit),
+            .Grouping => |grp| self.eval(grp.expression),
+            .Binary => |binary| self.binaryExpr(binary),
+            .Unary => |unary| self.unaryExpr(unary),
+        };
+    }
+
+    fn literalExpr(self: *Interpreter, expr: LiteralExpr) Value {
+        _ = self;
+        return switch (expr.value) {
+            .number => |n| Value{ .number = n },
+            .string => |s| Value{ .string = s },
+            .boolean => |b| Value{ .boolean = b },
+            .nil => Value.nil,
+        };
+    }
+
+    fn unaryExpr(self: *Interpreter, expr: UnaryExpr) Value {
+        const right = self.eval(expr.right);
+        switch (expr.operator.type) {
+            .MINUS => {
+                return Value{ .number = -self.expectNumber(right) };
+            },
+            .BANG => {
+                return Value{ .boolean = !self.isTruthy(right) };
+            },
+            else => unreachable,
+        }
+    }
+
+    fn binaryExpr(self: *Interpreter, expr: BinaryExpr) Value {
+        const left = self.eval(expr.left);
+        const right = self.eval(expr.right);
+
+        return switch (expr.operator.type) {
+            .PLUS => switch (left) {
+                .number => |l| switch (right) {
+                    .number => |r| .{ .number = l + r },
+                    else => self.runtimeError("Operands must be two numbers or two strings."),
+                },
+
+                .string => |l| switch (right) {
+                    .string => |r| {
+                        const concat = self.concatStrings(l, r) catch {
+                            self.runtimeError("Could not concataned thos strings brother.");
+                            return "";
+                        };
+                        return .{ .string = concat };
+                    },
+                    else => self.runtimeError("Operands must be two numbers or two strings."),
+                },
+                else => self.runtimeError("Operands must be two numbers or two strings."),
+            },
+
+            .MINUS => {
+                const l = self.expectNumber(left);
+                const r = self.expectNumber(right);
+                return .{ .number = l - r };
+            },
+
+            .STAR => {
+                const l = self.expectNumber(left);
+                const r = self.expectNumber(right);
+                return .{ .number = l * r };
+            },
+
+            .SLASH => {
+                const l = self.expectNumber(left);
+                const r = self.expectNumber(right);
+                return .{ .number = l / r };
+            },
+
+            .GREATER => {
+                const l = self.expectNumber(left);
+                const r = self.expectNumber(right);
+                return .{ .boolean = l > r };
+            },
+
+            .GREATER_EQUAL => {
+                const l = self.expectNumber(left);
+                const r = self.expectNumber(right);
+                return .{ .boolean = l >= r };
+            },
+
+            .LESS => {
+                const l = self.expectNumber(left);
+                const r = self.expectNumber(right);
+                return .{ .boolean = l < r };
+            },
+
+            .LESS_EQUAL => {
+                const l = self.expectNumber(left);
+                const r = self.expectNumber(right);
+                return .{ .boolean = l <= r };
+            },
+
+            .EQUAL_EQUAL => .{ .boolean = self.isEqual(left, right) },
+
+            .BANG_EQUAL => .{ .boolean = !self.isEqual(left, right) },
+
+            else => unreachable,
+        };
+    }
+
+    fn isTruthy(_: *Interpreter, value: Value) bool {
+        return switch (value) {
+            .nil => false,
+            .boolean => |b| b,
+            else => true,
+        };
+    }
+    fn concatStrings(
+        self: *Interpreter,
+        a: []const u8,
+        b: []const u8,
+    ) ![]const u8 {
+        const buf = try self.alloc.alloc(u8, a.len + b.len);
+        @memcpy(buf[0..a.len], a);
+        @memcpy(buf[a.len..], b);
+        return buf;
+    }
+    //
+    // I know this is ugly, send an email to openAI if you have any complains
+    fn isEqual(_: *Interpreter, v1: Value, v2: Value) bool {
+        return switch (v1) {
+            .nil => v2 == .nil,
+
+            .number => |n1| switch (v2) {
+                .number => |n2| n1 == n2,
+                else => false,
+            },
+
+            .boolean => |b1| switch (v2) {
+                .boolean => |b2| b1 == b2,
+                else => false,
+            },
+
+            .string => |s1| switch (v2) {
+                .string => |s2| std.mem.eql(u8, s1, s2),
+                else => false,
+            },
+        };
+    }
+
+    fn expectNumber(_: *Interpreter, value: Value) f64 {
+        return switch (value) {
+            .number => |n| n,
+            else => {
+                // I hate the idea of using panic here, will go back to this later (maybe never)
+                @panic("Operand must be a number.");
+            },
+        };
+    }
+    fn runtimeError(self: *Interpreter, message: []const u8) noreturn {
+        _ = self; // silence unused warning if not used yet
+        std.debug.panic("Runtime error: {s}", .{message});
     }
 };
