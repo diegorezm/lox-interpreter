@@ -28,13 +28,13 @@ pub fn main() !void {
 
     const tokens = l.getTokens();
     var parser = interpreter.Parser.init(arena.allocator(), tokens);
-    var stmts = try parser.parse();
+    const stmts = try parser.parse();
 
     var buf: [1024]u8 = undefined;
     var stdout = std.fs.File.stdout().writer(&buf);
 
     var i = try interpreter.Interpreter.init(arena.allocator(), &stdout.interface);
-    i.interpret(&stmts);
+    i.interpret(stmts);
 
     try stdout.interface.writeByte('\n');
     try stdout.interface.flush();

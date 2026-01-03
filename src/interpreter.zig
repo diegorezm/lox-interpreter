@@ -142,26 +142,25 @@ pub const Value = union(enum) {
     number: f64,
     boolean: bool,
     string: []const u8,
+    callable: *LoxCallable,
     nil,
 };
 
-pub const Expr = union(enum) {
-    Binary: BinaryExpr,
-    Unary: UnaryExpr,
-    Literal: LiteralExpr,
-    Grouping: GroupingExpr,
-    Variable: VariableExpr,
-    Assign: AssignExpr,
-    Logical: LogicalExpr,
-};
+pub const Expr = union(enum) { Binary: BinaryExpr, Unary: UnaryExpr, Literal: LiteralExpr, Grouping: GroupingExpr, Variable: VariableExpr, Assign: AssignExpr, Logical: LogicalExpr, Call: CallExpr };
 
 pub const ExprStmt = struct {
     expression: *Expr,
 };
 
+pub const CallExpr = struct { callee: *Expr, paren: Token, arguments: ?[]*Expr };
+
 pub const PrintStmt = struct {
     expression: *Expr,
 };
+
+const ReturnSignal = struct { value: ?Value };
+
+pub const ReturnStmt = struct { keyword: Token, value: ?*Expr };
 
 pub const VarStmt = struct {
     name: Token,
@@ -174,7 +173,7 @@ pub const WhileStmt = struct {
 };
 
 pub const BlockStmt = struct {
-    statements: []Stmt,
+    statements: []const *Stmt,
 };
 
 pub const IFStmt = struct {
@@ -183,13 +182,89 @@ pub const IFStmt = struct {
     elseBranch: ?*Stmt,
 };
 
-pub const Stmt = union(enum) { expr: ExprStmt, print: PrintStmt, var_decl: VarStmt, block: BlockStmt, if_decl: IFStmt, while_decl: WhileStmt };
+pub const FunctionStmt = struct {
+    name: Token,
+    params: []Token,
+    body: []const *Stmt,
+};
+
+pub const Stmt = union(enum) { expr: ExprStmt, print: PrintStmt, var_decl: VarStmt, block: BlockStmt, if_decl: IFStmt, while_decl: WhileStmt, function_decl: FunctionStmt, return_stmt: ReturnStmt };
 
 pub const Stmts = std.ArrayList(Stmt);
 
-const ParserError = error{ ExpectedExpression, ExpectedRightParen, UnexpectedToken, OutOfMemory, InvalidAssignment };
+const ParserError = error{ ExpectedExpression, ExpectedRightParen, UnexpectedToken, OutOfMemory, InvalidAssignment, TooManyArguments };
 
-pub const RuntimeError = error{ UndefinedVariable, InvalidOperands, DivisionByZero, OutputError, OutOfMemory, TypeError };
+pub const RuntimeError = error{ UndefinedVariable, InvalidOperands, DivisionByZero, OutputError, OutOfMemory, TypeError, TooManyArguments, NotEnoughArguments, InvalidArity, Return };
+
+pub const UserFunction = struct {
+    arity: usize,
+    declaration: *const FunctionStmt,
+    clousure: *Environment,
+
+    pub fn init(declaration: *const FunctionStmt, clousure: *Environment) UserFunction {
+        return .{ .arity = declaration.params.len, .declaration = declaration, .clousure = clousure };
+    }
+
+    pub fn call(self: *UserFunction, interpreter: *Interpreter, args: []const Value) RuntimeError!?Value {
+        if (args.len != self.arity) return RuntimeError.InvalidArity;
+        const env = interpreter.alloc.create(Environment) catch {
+            return RuntimeError.OutOfMemory;
+        };
+        env.* = Environment.init(interpreter.alloc, self.clousure);
+
+        for (0..self.arity) |index| {
+            try env.define(self.declaration.params[index].lexeme, args[index]);
+        }
+
+        _ = interpreter.execBlock(self.declaration.body, env) catch |err| switch (err) {
+            RuntimeError.Return => {
+                const rv = interpreter.returnSignal orelse Value{ .nil = {} };
+                interpreter.returnSignal = null;
+                return rv;
+            },
+            else => return err,
+        };
+        return null;
+    }
+};
+
+pub const NativeFunction = struct {
+    arity: usize,
+    func: *const fn (*Interpreter, []const Value) RuntimeError!?Value,
+
+    pub fn call(
+        self: *NativeFunction,
+        interpreter: *Interpreter,
+        args: []const Value,
+    ) RuntimeError!?Value {
+        return try self.func(interpreter, args);
+    }
+};
+
+// I just learned about this pattern, that is why the other structs don't follow it
+// but it is pretty cool
+pub const LoxCallable = union(enum) {
+    userFn: UserFunction,
+    nativeFn: NativeFunction,
+
+    pub fn arity(self: *LoxCallable) usize {
+        return switch (self.*) {
+            .userFn => self.userFn.arity,
+            .nativeFn => self.nativeFn.arity,
+        };
+    }
+
+    pub fn call(
+        self: *LoxCallable,
+        interpreter: *Interpreter,
+        args: []const Value,
+    ) RuntimeError!?Value {
+        return switch (self.*) {
+            .userFn => |*f| try f.call(interpreter, args),
+            .nativeFn => |*nf| try nf.call(interpreter, args),
+        };
+    }
+};
 // ----
 
 // ---- Utils ----
@@ -229,6 +304,14 @@ fn makeAssign(
         },
     };
     return expr;
+}
+
+pub fn makeCall(allocator: std.mem.Allocator, callee: *Expr, paren: Token, arguments: ?[]*Expr) !*Expr {
+    const node = try allocator.create(Expr);
+    node.* = Expr{
+        .Call = CallExpr{ .callee = callee, .arguments = arguments, .paren = paren },
+    };
+    return node;
 }
 
 pub fn makeLiteral(
@@ -292,6 +375,16 @@ pub fn printValue(value: Value, writer: *std.io.Writer) !void {
         .number => |n| try writer.print("{d}", .{n}),
         .boolean => |b| try writer.print("{}", .{b}),
         .string => |s| try writer.print("{s}", .{s}),
+        .callable => |s| {
+            switch (s.*) {
+                .nativeFn => |native| {
+                    try writer.print("<fn @{x}>", .{@intFromPtr(native.func)});
+                },
+                .userFn => |user| {
+                    try writer.print("<fn {s} >", .{user.declaration.name.lexeme});
+                },
+            }
+        },
         .nil => try writer.writeAll("nil"),
     }
 }
@@ -602,22 +695,28 @@ pub const Parser = struct {
         return .{ .alloc = alloc, .tokens = tokens };
     }
 
-    pub fn parse(self: *Parser) !Stmts {
-        var stmts: std.ArrayList(Stmt) = .empty;
+    pub fn parse(self: *Parser) ![]const *Stmt {
+        var stmts: std.ArrayList(*Stmt) = .empty;
 
         while (!self.isAtEnd()) {
             if (self.declaration()) |stmt| {
-                try stmts.append(self.alloc, stmt.*);
+                try stmts.append(self.alloc, stmt);
             }
         }
 
-        return stmts;
+        const items = stmts.items;
+        return items;
     }
 
     fn declaration(self: *Parser) ?*Stmt {
-        const tokenTypes = [_]TokenType{.VAR};
+        if (self.match(&[_]TokenType{.FN})) {
+            return self.function("function") catch {
+                self.sync();
+                return null;
+            };
+        }
 
-        if (self.match(&tokenTypes)) {
+        if (self.match(&[_]TokenType{.VAR})) {
             return self.varDeclaration() catch {
                 self.sync();
                 return null;
@@ -634,13 +733,16 @@ pub const Parser = struct {
         if (self.match(&[_]TokenType{TokenType.PRINT})) return try self.printStatement();
         if (self.match(&[_]TokenType{TokenType.FOR})) return try self.forStatement();
         if (self.match(&[_]TokenType{TokenType.IF})) return try self.ifStatement();
+        if (self.match(&[_]TokenType{TokenType.RETURN})) return try self.returnStatement();
         if (self.match(&[_]TokenType{TokenType.WHILE})) return try self.whileStatement();
         if (self.match(&[_]TokenType{TokenType.LEFT_BRACE})) {
             const b = try self.block();
+
             const stmt = self.alloc.create(Stmt) catch {
                 return ParserError.OutOfMemory;
             };
-            stmt.* = Stmt{ .block = BlockStmt{ .statements = b.items } };
+
+            stmt.* = Stmt{ .block = BlockStmt{ .statements = b } };
             return stmt;
         }
         return try self.expressionStatement();
@@ -673,18 +775,19 @@ pub const Parser = struct {
         var body = try self.statement(); // body: *Stmt
 
         if (increment) |inc| {
-            var stmts: Stmts = .empty;
+            var stmts: std.ArrayList(*Stmt) = .empty;
             errdefer stmts.deinit(self.alloc);
 
-            try stmts.append(self.alloc, body.*);
+            try stmts.append(self.alloc, body);
 
             const incStmt = try self.alloc.create(Stmt);
             incStmt.* = Stmt{
                 .expr = ExprStmt{ .expression = inc },
             };
-            try stmts.append(self.alloc, incStmt.*);
 
+            try stmts.append(self.alloc, incStmt);
             const blockStmt = try self.alloc.create(Stmt);
+
             blockStmt.* = Stmt{
                 .block = BlockStmt{ .statements = stmts.items },
             };
@@ -705,11 +808,11 @@ pub const Parser = struct {
         body = whileStmt;
 
         if (initializer) |i| {
-            var stmts: Stmts = .empty;
+            var stmts: std.ArrayList(*Stmt) = .empty;
             errdefer stmts.deinit(self.alloc);
 
-            try stmts.append(self.alloc, i.*);
-            try stmts.append(self.alloc, body.*);
+            try stmts.append(self.alloc, i);
+            try stmts.append(self.alloc, body);
 
             const blockStmt = try self.alloc.create(Stmt);
             blockStmt.* = Stmt{
@@ -780,6 +883,21 @@ pub const Parser = struct {
         return stmt;
     }
 
+    fn returnStatement(self: *Parser) ParserError!*Stmt {
+        const keyword = self.previous();
+        var value: ?*Expr = null;
+
+        if (!self.check(.SEMICOLON)) {
+            value = try self.expression();
+        }
+        _ = try self.consume(TokenType.SEMICOLON, "Expect ';' after value.");
+
+        const stmt = try self.alloc.create(Stmt);
+        stmt.* = .{ .return_stmt = ReturnStmt{ .keyword = keyword, .value = value } };
+
+        return stmt;
+    }
+
     fn expressionStatement(self: *Parser) ParserError!*Stmt {
         const value = try self.expression();
         _ = try self.consume(TokenType.SEMICOLON, "Expect ';' after value.");
@@ -787,6 +905,57 @@ pub const Parser = struct {
         stmt.* = .{
             .expr = ExprStmt{
                 .expression = value,
+            },
+        };
+
+        return stmt;
+    }
+
+    fn function(self: *Parser, fnKind: []const u8) ParserError!*Stmt {
+        var buf: [64]u8 = undefined;
+
+        const msg_name = std.fmt.bufPrint(&buf, "Expect {s} name.", .{fnKind}) catch {
+            return ParserError.OutOfMemory;
+        };
+
+        const name = try self.consume(.IDENTIFIER, msg_name);
+
+        const msg_paren = std.fmt.bufPrint(&buf, "Expect '(' after {s} name.", .{fnKind}) catch {
+            return ParserError.OutOfMemory;
+        };
+        _ = try self.consume(.LEFT_PAREN, msg_paren);
+
+        var parameters = std.ArrayList(Token).initCapacity(self.alloc, 128) catch {
+            return ParserError.OutOfMemory;
+        };
+
+        if (!self.check(.RIGHT_PAREN)) {
+            while (true) {
+                if (parameters.items.len >= 128) return ParserError.TooManyArguments;
+                const param = try self.consume(.IDENTIFIER, "Expect parameter name.");
+                parameters.append(self.alloc, param) catch {
+                    return ParserError.OutOfMemory;
+                };
+                if (!self.match(&[_]TokenType{.COMMA})) break;
+            }
+        }
+
+        _ = try self.consume(.RIGHT_PAREN, "Expect ')' after parameters.");
+
+        const msg_body = std.fmt.bufPrint(&buf, "Expect '{{' before {s} body.", .{fnKind}) catch {
+            return ParserError.OutOfMemory;
+        };
+        _ = try self.consume(.LEFT_BRACE, msg_body);
+
+        const body = try self.block();
+
+        const stmt = try self.alloc.create(Stmt);
+
+        stmt.* = Stmt{
+            .function_decl = FunctionStmt{
+                .name = name,
+                .params = parameters.items,
+                .body = body,
             },
         };
 
@@ -904,10 +1073,51 @@ pub const Parser = struct {
         while (self.match(&tokenTypes)) {
             const operator = self.previous();
             const right = try self.unary();
-            return makeUnary(self.alloc, operator, right);
+            return try makeUnary(self.alloc, operator, right);
         }
 
-        return try self.primary();
+        return try self.call();
+    }
+
+    fn call(self: *Parser) ParserError!*Expr {
+        var expr = try self.primary();
+        while (true) {
+            if (self.match(&[_]TokenType{.LEFT_PAREN})) {
+                expr = try self.finishCall(expr);
+            } else {
+                break;
+            }
+        }
+        return expr;
+    }
+
+    fn finishCall(self: *Parser, callee: *Expr) ParserError!*Expr {
+        var args = std.ArrayList(*Expr).initCapacity(self.alloc, 128) catch {
+            return ParserError.OutOfMemory;
+        };
+
+        if (!self.check(.RIGHT_PAREN)) {
+            // check if there is a comma, if there is none then it means the function call
+            // has no more args.
+            const first = try self.expression(); // I have to do this because this language does not have do whiles (i think)
+            args.append(self.alloc, first) catch {
+                return ParserError.OutOfMemory;
+            };
+            while (self.match(&[_]TokenType{.COMMA})) {
+                if (args.items.len >= 127) {
+                    const p = self.peek();
+                    reportParseError(p.?, "Too many arguments.");
+                }
+
+                const expr = try self.expression();
+                args.append(self.alloc, expr) catch {
+                    return ParserError.OutOfMemory;
+                };
+            }
+        }
+
+        const paren = try self.consume(.RIGHT_PAREN, "Expect ')' after arguments.");
+        return try makeCall(self.alloc, callee, paren, args.items);
     }
 
     fn primary(self: *Parser) ParserError!*Expr {
@@ -980,18 +1190,18 @@ pub const Parser = struct {
         }
     }
 
-    fn block(self: *Parser) ParserError!std.ArrayList(Stmt) {
-        var stmts: std.ArrayList(Stmt) = .empty;
+    fn block(self: *Parser) ParserError![]const *Stmt {
+        var stmts: std.ArrayList(*Stmt) = .empty;
 
         while (!self.check(TokenType.RIGHT_BRACE) and !self.isAtEnd()) {
-            if (self.declaration()) |stmt| {
-                stmts.append(self.alloc, stmt.*) catch {
+            if (self.declaration()) |stmtPtr| {
+                stmts.append(self.alloc, stmtPtr) catch {
                     return ParserError.OutOfMemory;
                 };
             }
         }
         _ = try self.consume(TokenType.RIGHT_BRACE, "Expect '}' after block.");
-        return stmts;
+        return stmts.items;
     }
 
     fn match(self: *Parser, tokenTypes: []const TokenType) bool {
@@ -1091,10 +1301,10 @@ pub const Environment = struct {
     /// Defines a entry inside of the environment hahsmap.
     pub fn define(
         self: *Environment,
-        name: Token,
+        name: []const u8,
         value: Value,
     ) RuntimeError!void {
-        self.values.put(name.lexeme, value) catch {
+        self.values.put(name, value) catch {
             return RuntimeError.OutOfMemory;
         };
     }
@@ -1103,11 +1313,11 @@ pub const Environment = struct {
     // entries in the hashmap, only modifying entries that already exists.
     pub fn assign(
         self: *Environment,
-        name: Token,
+        name: []const u8,
         value: Value,
     ) RuntimeError!void {
-        if (self.values.contains(name.lexeme)) {
-            self.values.put(name.lexeme, value) catch {
+        if (self.values.contains(name)) {
+            self.values.put(name, value) catch {
                 return RuntimeError.OutOfMemory;
             };
             return;
@@ -1123,9 +1333,9 @@ pub const Environment = struct {
     /// Gets a token from the environment.
     pub fn get(
         self: *Environment,
-        name: Token,
+        name: []const u8,
     ) RuntimeError!Value {
-        if (self.values.get(name.lexeme)) |value| {
+        if (self.values.get(name)) |value| {
             return value;
         }
 
@@ -1141,17 +1351,31 @@ pub const Environment = struct {
 pub const Interpreter = struct {
     alloc: std.mem.Allocator,
     writer: *std.io.Writer,
+    globalEnv: *Environment,
     env: *Environment,
+    returnSignal: ?Value,
 
     pub fn init(alloc: std.mem.Allocator, writer: *std.io.Writer) !Interpreter {
-        const env = try alloc.create(Environment);
-        env.* = Environment.init(alloc, null);
-        return .{ .alloc = alloc, .writer = writer, .env = env };
+        const globalEnv = try alloc.create(Environment);
+        globalEnv.* = Environment.init(alloc, null);
+
+        const clockNativeFn = NativeFunction{ .arity = 0, .func = &clock_fn };
+        const callable = alloc.create(LoxCallable) catch {
+            return RuntimeError.OutOfMemory;
+        };
+
+        callable.* = LoxCallable{ .nativeFn = clockNativeFn };
+
+        try globalEnv.define("clock", Value{ .callable = callable });
+
+        const env = globalEnv;
+
+        return .{ .alloc = alloc, .writer = writer, .env = env, .globalEnv = globalEnv, .returnSignal = null };
     }
 
-    pub fn interpret(self: *Interpreter, stmts: *const Stmts) void {
-        for (stmts.items) |stmt| {
-            self.exec(&stmt) catch |err| {
+    pub fn interpret(self: *Interpreter, stmts: []const *Stmt) void {
+        for (stmts) |stmtPtr| {
+            self.exec(stmtPtr) catch |err| {
                 self.runtimeError(err, null, null);
                 return;
             };
@@ -1167,11 +1391,13 @@ pub const Interpreter = struct {
             .Variable => |variable| try self.visitVariableExpr(variable),
             .Assign => |assign| try self.visitAssignExpr(assign),
             .Logical => |logical| try self.visitLogicalExpr(logical),
+            .Call => |call| try self.visitCallExpr(call),
         };
     }
 
     fn exec(self: *Interpreter, stmt: *const Stmt) RuntimeError!void {
         switch (stmt.*) {
+            .function_decl => |*f| try self.visitFunctionStmt(f),
             .expr => |s| {
                 _ = try self.eval(s.expression);
             },
@@ -1180,12 +1406,13 @@ pub const Interpreter = struct {
             .block => |b| try self.visitBlockStmt(b),
             .var_decl => |s| try self.visitVarStmt(s),
             .print => |s| try self.visitPrintStmt(s),
+            .return_stmt => |r| try self.visitReturnStmt(r),
         }
     }
 
     fn execBlock(
         self: *Interpreter,
-        stmts: []const Stmt,
+        stmts: []const *Stmt,
         env: *Environment,
     ) RuntimeError!void {
         const previous = self.env;
@@ -1193,13 +1420,34 @@ pub const Interpreter = struct {
         defer self.env = previous;
 
         for (stmts) |stmt| {
-            try self.exec(&stmt);
+            try self.exec(stmt);
         }
     }
 
     fn visitBlockStmt(self: *Interpreter, stmt: BlockStmt) RuntimeError!void {
-        var localEnv = Environment.init(self.alloc, self.env);
-        try self.execBlock(stmt.statements, &localEnv);
+        const env_ptr = try self.alloc.create(Environment);
+        env_ptr.* = Environment.init(self.alloc, self.env);
+        try self.execBlock(stmt.statements, env_ptr);
+    }
+
+    fn visitFunctionStmt(self: *Interpreter, stmt: *const FunctionStmt) RuntimeError!void {
+        const function = UserFunction.init(stmt, self.env);
+
+        const callable = self.alloc.create(LoxCallable) catch {
+            return RuntimeError.OutOfMemory;
+        };
+
+        callable.* = LoxCallable{ .userFn = function };
+        try self.env.define(stmt.name.lexeme, Value{ .callable = callable });
+    }
+
+    fn visitReturnStmt(self: *Interpreter, stmt: ReturnStmt) RuntimeError!void {
+        if (stmt.value) |expr| {
+            self.returnSignal = try self.eval(expr);
+        } else {
+            self.returnSignal = Value{ .nil = {} };
+        }
+        return RuntimeError.Return;
     }
 
     fn visitPrintStmt(self: *Interpreter, stmt: PrintStmt) RuntimeError!void {
@@ -1222,7 +1470,7 @@ pub const Interpreter = struct {
 
     fn visitAssignExpr(self: *Interpreter, expr: AssignExpr) RuntimeError!Value {
         const value = try self.eval(expr.value);
-        try self.env.assign(expr.name, value);
+        try self.env.assign(expr.name.lexeme, value);
         return value;
     }
 
@@ -1241,7 +1489,7 @@ pub const Interpreter = struct {
         if (stmt.initializer) |expr| {
             v = try self.eval(expr);
         }
-        try self.env.define(stmt.name, v);
+        try self.env.define(stmt.name.lexeme, v);
     }
 
     fn visitWhileStmt(self: *Interpreter, stmt: WhileStmt) RuntimeError!void {
@@ -1251,7 +1499,7 @@ pub const Interpreter = struct {
     }
 
     fn visitVariableExpr(self: *Interpreter, expr: VariableExpr) RuntimeError!Value {
-        return self.env.get(expr.name);
+        return self.env.get(expr.name.lexeme);
     }
 
     fn visitLiteralExpr(_: *Interpreter, expr: LiteralExpr) RuntimeError!Value {
@@ -1325,6 +1573,42 @@ pub const Interpreter = struct {
         };
     }
 
+    fn visitCallExpr(self: *Interpreter, expr: CallExpr) RuntimeError!Value {
+        const callee = try self.eval(expr.callee);
+        var arguments = std.ArrayList(Value).initCapacity(self.alloc, 128) catch {
+            return RuntimeError.OutOfMemory;
+        };
+
+        if (expr.arguments) |args| {
+            for (args) |arg| {
+                const v = try self.eval(arg);
+                arguments.append(self.alloc, v) catch {
+                    return RuntimeError.OutOfMemory;
+                };
+            }
+        }
+
+        return switch (callee) {
+            .callable => |func| {
+                var callable = func.*;
+
+                if (arguments.items.len > callable.arity()) {
+                    return RuntimeError.TooManyArguments;
+                }
+                if (arguments.items.len < callable.arity()) {
+                    return RuntimeError.NotEnoughArguments;
+                }
+
+                const v = try callable.call(self, arguments.items);
+                if (v) |value| {
+                    return value;
+                }
+                return Value{ .nil = {} };
+            },
+            else => return RuntimeError.TypeError,
+        };
+    }
+
     fn isTruthy(_: *Interpreter, value: Value) bool {
         return switch (value) {
             .nil => false,
@@ -1348,6 +1632,9 @@ pub const Interpreter = struct {
 
     fn isEqual(_: *Interpreter, v1: Value, v2: Value) bool {
         return switch (v1) {
+            .callable => {
+                return false;
+            },
             .nil => v2 == .nil,
             .number => |n1| switch (v2) {
                 .number => |n2| n1 == n2,
@@ -1369,6 +1656,12 @@ pub const Interpreter = struct {
             .number => |n| n,
             else => RuntimeError.TypeError,
         };
+    }
+
+    fn clock_fn(_: *Interpreter, _: []const Value) RuntimeError!?Value {
+        const ml: f64 = @floatFromInt(std.time.milliTimestamp());
+        const t: f64 = ml / 1000.0;
+        return Value{ .number = t };
     }
 
     fn runtimeError(
