@@ -1309,6 +1309,34 @@ pub const Environment = struct {
         };
     }
 
+    pub fn getAt(self: *Environment, distance: usize, name: []const u8) RuntimeError!Value {
+        const enviroment = try self.ancestor(distance);
+        if (enviroment) |env| {
+            return try env.get(name);
+        }
+        return RuntimeError.UndefinedVariable;
+    }
+    pub fn assignAt(self: *Environment, distance: usize, name: Token, value: Value) RuntimeError!void {
+        const enviroment = try self.ancestor(distance);
+        if (enviroment) |env| {
+            env.values.put(name.lexeme, value);
+        }
+    }
+
+    pub fn ancestor(self: *Environment, distance: usize) RuntimeError!?*Environment {
+        var env = self;
+        var i: usize = 0;
+        while (i < distance) : (i += 1) {
+            if (env.enclosing) |enclosing| {
+                env = enclosing;
+            } else {
+                return null;
+            }
+        }
+
+        return env;
+    }
+
     // Assigns a variable. This is different from `define` because here we are not creating any new
     // entries in the hashmap, only modifying entries that already exists.
     pub fn assign(
@@ -1354,6 +1382,7 @@ pub const Interpreter = struct {
     globalEnv: *Environment,
     env: *Environment,
     returnSignal: ?Value,
+    locals: std.AutoHashMap(*Expr, usize),
 
     pub fn init(alloc: std.mem.Allocator, writer: *std.io.Writer) !Interpreter {
         const globalEnv = try alloc.create(Environment);
@@ -1370,7 +1399,9 @@ pub const Interpreter = struct {
 
         const env = globalEnv;
 
-        return .{ .alloc = alloc, .writer = writer, .env = env, .globalEnv = globalEnv, .returnSignal = null };
+        const locals = std.AutoHashMap(*Expr, usize).init(alloc);
+
+        return .{ .alloc = alloc, .writer = writer, .env = env, .globalEnv = globalEnv, .returnSignal = null, .locals = locals };
     }
 
     pub fn interpret(self: *Interpreter, stmts: []const *Stmt) void {
@@ -1470,6 +1501,7 @@ pub const Interpreter = struct {
 
     fn visitAssignExpr(self: *Interpreter, expr: AssignExpr) RuntimeError!Value {
         const value = try self.eval(expr.value);
+        const distance = self.locals.get(expr);
         try self.env.assign(expr.name.lexeme, value);
         return value;
     }
@@ -1500,6 +1532,14 @@ pub const Interpreter = struct {
 
     fn visitVariableExpr(self: *Interpreter, expr: VariableExpr) RuntimeError!Value {
         return self.env.get(expr.name.lexeme);
+    }
+
+    fn lookUpVariable(self: *Interpreter, name: Token, expr: *Expr) RuntimeError!Value {
+        const distance = self.locals.get(expr);
+        if (distance) {
+            return self.env.getAt(distance, name.lexeme);
+        }
+        return self.globalEnv.get(name.lexeme);
     }
 
     fn visitLiteralExpr(_: *Interpreter, expr: LiteralExpr) RuntimeError!Value {
@@ -1571,6 +1611,10 @@ pub const Interpreter = struct {
             .BANG_EQUAL => .{ .boolean = !self.isEqual(left, right) },
             else => unreachable,
         };
+    }
+
+    fn resolve(self: *Interpreter, expr: Expr, depth: usize) RuntimeError!void {
+        self.locals.put(expr, depth);
     }
 
     fn visitCallExpr(self: *Interpreter, expr: CallExpr) RuntimeError!Value {
@@ -1695,5 +1739,159 @@ pub const Interpreter = struct {
                 );
             }
         }
+    }
+};
+
+const Resolver = struct {
+    interpreter: *Interpreter,
+    scopes: std.ArrayList(std.StringHashMap(bool)),
+    alloc: std.mem.Allocator,
+
+    pub fn init(alloc: std.mem.Allocator, interpreter: *Interpreter) Resolver {
+        const scopes: std.ArrayList(std.StringHashMap(bool)) = .empty;
+        return .{
+            .alloc = alloc,
+            .interpreter = interpreter,
+            .scopes = scopes,
+        };
+    }
+
+    pub fn deinit(self: *Resolver) void {
+        for (self.scopes.items) |*scope| scope.deinit();
+        self.scopes.deinit();
+    }
+
+    fn visitVarStmt(self: *Resolver, stmt: VarStmt) !void {
+        self.declare(stmt.name);
+        if (stmt.initializer) |initializer| try self.resolveExpr(initializer);
+        self.define(stmt.name);
+    }
+
+    fn visitVariableExpr(self: *Resolver, expr: VariableExpr) !void {
+        if (!self.isEmpty() and self.scopes.items[self.len() - 1].get(expr.name.lexeme) == false) {
+            std.log.err("[Line: {d}] {s}: Can't read local variable in its own initializer.\n", .{ expr.name.line, expr.name.lexeme });
+        }
+        self.resolveLocal(expr, expr.name);
+    }
+
+    fn visitAssigneExpr(self: *Resolver, expr: AssignExpr) !void {
+        try self.resolve(expr.value);
+        self.resolveLocal(expr, expr.name);
+    }
+
+    fn visitExpressionStmt(self: *Resolver, stmt: ExprStmt) !void {
+        try self.resolve(stmt.expression);
+    }
+
+    fn visitIfStmt(self: *Resolver, stmt: IFStmt) !void {
+        try self.resolve(stmt.condition);
+        try self.resolve(stmt.thenBranch);
+        if (stmt.elseBranch != null) try self.resolve(stmt.elseBranch);
+    }
+
+    fn visitPrintStmt(self: *Resolver, stmt: PrintStmt) !void {
+        try self.resolve(stmt.expression);
+    }
+
+    fn visitReturnStmt(self: *Resolver, stmt: ReturnStmt) !void {
+        if (stmt.value) |expr| {
+            try self.resolve(expr);
+        }
+    }
+
+    fn visitWhileStmt(self: *Resolver, stmt: WhileStmt) !void {
+        try self.resolve(stmt.condition);
+        try self.resolve(stmt.body);
+    }
+
+    fn visitBinaryExpr(self: *Resolver, expr: BinaryExpr) !void {
+        try self.resolve(expr.right);
+        try self.resolve(expr.left);
+    }
+
+    fn visitCallExpr(self: *Resolver, expr: CallExpr) !void {
+        try self.resolve(expr.callee);
+        if (expr.arguments) |args| for (args) |arg| {
+            try self.resolve(arg);
+        };
+    }
+
+    fn visitGroupingExpr(self: *Resolver, expr: GroupingExpr) !void {
+        try self.resolve(expr.expression);
+    }
+
+    fn visitLogicalExpr(self: *Resolver, expr: LogicalExpr) !void {
+        try self.resolve(expr.right);
+    }
+
+    fn visitLiteralExpr(_: *Resolver, _: LiteralExpr) !void {}
+
+    fn visitFunctionExpr(self: *Resolver, stmt: FunctionStmt) !void {
+        self.declare(stmt.name);
+        self.define(stmt.name);
+
+        self.resolveFunction(stmt);
+    }
+
+    fn resolveFunction(self: *Resolver, function: FunctionStmt) !void {
+        self.beginScope();
+        for (function.params) |param| {
+            self.declare(param);
+            self.define(param);
+        }
+        self.resolve(function.body);
+        self.endScope();
+    }
+
+    fn resolve(self: *Resolver, expr: *Expr) !void {
+        return;
+    }
+
+    fn beginScope(self: *Resolver) !void {
+        const scope = std.StringHashMap(bool).init(self.alloc);
+        try self.scopes.append(scope);
+    }
+
+    fn endScope(self: *Resolver) void {
+        const scope = self.scopes.pop();
+        scope.?.deinit();
+    }
+
+    fn declare(self: *Resolver, name: Token) !void {
+        if (self.scopes.items.len == 0) return;
+
+        var scope = &self.scopes.items[self.scopes.items.len - 1];
+        if (scope.contains(name.lexeme)) {
+            // Handle error: re‑declared variable in the same scope.
+            std.log.err("Already variable with this name in this scope: {s}", .{name.lexeme});
+        }
+        try scope.put(name.lexeme, false);
+    }
+
+    fn define(self: *Resolver, name: Token) void {
+        if (self.isEmpty()) return;
+        var scope = &self.scopes.items[self.scopes.items.len - 1];
+        _ = scope.put(name.lexeme, true) catch {}; // mark initialized
+    }
+
+    fn resolveLocal(self: *Resolver, expr: *Expr, name: Token) void {
+        const scopes_len = self.scopes.items.len;
+        var i: usize = scopes_len;
+        while (i > 0) : (i -= 1) {
+            const scope_i = &self.scopes.items[i - 1];
+            if (scope_i.contains(name.lexeme)) {
+                const distance = scopes_len - i;
+                self.interpreter.resolve(expr, distance);
+                return;
+            }
+        }
+    }
+
+    fn len(self: *Resolver) usize {
+        return self.scopes.items.len;
+    }
+
+    fn isEmpty(self: *Resolver) bool {
+        return self.scopes.items.len == 0;
     }
 };
