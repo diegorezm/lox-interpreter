@@ -1,7 +1,9 @@
-var language = "lox";
-var test = 1234;
-var test2 = 1234.2;
-var b = TRUE;
-var b2 = FALSE;
-var tn = nil;
-print language;
+var a = 0;
+var temp;
+
+for (var b = 1; a < 10000; b = temp + b) {
+  print a;
+  print "\n";
+  temp = a;
+  a = b;
+}
