@@ -20,7 +20,7 @@ pub fn build(b: *std.Build) void {
     // ------------------------------------------------------------
     const interpreter_exe = addExecutable(
         b,
-        "jlox",
+        "zlox",
         "src/main.zig",
         target,
         optimize,
