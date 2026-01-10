@@ -153,8 +153,11 @@ pub const ExprStmt = struct {
 
 pub const CallExpr = struct { callee: *Expr, paren: Token, arguments: ?[]*Expr };
 pub const GetExpr = struct { obj: *Expr, name: Token };
+pub const SetExpr = struct { obj: *Expr, name: Token, value: *Expr };
 
-pub const Expr = union(enum) { Binary: BinaryExpr, Unary: UnaryExpr, Literal: LiteralExpr, Grouping: GroupingExpr, Variable: VariableExpr, Assign: AssignExpr, Logical: LogicalExpr, Call: CallExpr, Get: GetExpr };
+pub const ThisExpr = struct { keyword: Token };
+
+pub const Expr = union(enum) { Binary: BinaryExpr, Unary: UnaryExpr, Literal: LiteralExpr, Grouping: GroupingExpr, Variable: VariableExpr, Assign: AssignExpr, Logical: LogicalExpr, Call: CallExpr, Get: GetExpr, Set: SetExpr, This: ThisExpr };
 
 pub const PrintStmt = struct {
     expression: *Expr,
@@ -196,30 +199,41 @@ pub const Stmt = union(enum) { expr: ExprStmt, print: PrintStmt, var_decl: VarSt
 
 pub const Stmts = std.ArrayList(Stmt);
 
-pub const FunctionType = enum { NONE, FUNCTION };
+pub const FunctionType = enum { NONE, FUNCTION, METHOD };
+pub const ClassType = enum { NONE, CLASS };
 
 const ParserError = error{ ExpectedExpression, ExpectedRightParen, UnexpectedToken, OutOfMemory, InvalidAssignment, TooManyArguments };
 
-pub const RuntimeError = error{ UndefinedVariable, InvalidOperands, DivisionByZero, OutputError, OutOfMemory, TypeError, TooManyArguments, NotEnoughArguments, InvalidArity, Return, RedeclaredVariable, ReadInOwnInitializer, TopLevelReturn, InvalidPropertyCall };
+pub const RuntimeError = error{ UndefinedVariable, InvalidOperands, DivisionByZero, OutputError, OutOfMemory, TypeError, TooManyArguments, NotEnoughArguments, InvalidArity, Return, RedeclaredVariable, ReadInOwnInitializer, TopLevelReturn, InvalidPropertyCall, InvalidUseOfThis };
 
 pub const UserFunction = struct {
     arity: usize,
     declaration: *const FunctionStmt,
-    clousure: *Environment,
+    closure: *Environment,
 
-    pub fn init(declaration: *const FunctionStmt, clousure: *Environment) UserFunction {
-        return .{ .arity = declaration.params.len, .declaration = declaration, .clousure = clousure };
+    pub fn init(declaration: *const FunctionStmt, closure: *Environment) UserFunction {
+        return .{
+            .arity = declaration.params.len,
+            .declaration = declaration,
+            .closure = closure,
+        };
     }
 
-    pub fn call(self: *UserFunction, interpreter: *Interpreter, args: []const Value) RuntimeError!?Value {
-        if (args.len != self.arity) return RuntimeError.InvalidArity;
+    pub fn call(
+        self: *UserFunction,
+        interpreter: *Interpreter,
+        args: []const Value,
+    ) RuntimeError!?Value {
+        if (args.len != self.arity)
+            return RuntimeError.InvalidArity;
+
         const env = interpreter.alloc.create(Environment) catch {
             return RuntimeError.OutOfMemory;
         };
-        env.* = Environment.init(interpreter.alloc, self.clousure);
+        env.* = Environment.init(interpreter.alloc, self.closure);
 
-        for (0..self.arity) |index| {
-            try env.define(self.declaration.params[index].lexeme, args[index]);
+        for (0..self.arity) |i| {
+            try env.define(self.declaration.params[i].lexeme, args[i]);
         }
 
         _ = interpreter.execBlock(self.declaration.body, env) catch |err| switch (err) {
@@ -230,7 +244,26 @@ pub const UserFunction = struct {
             },
             else => return err,
         };
+
         return null;
+    }
+
+    pub fn bind(
+        self: *UserFunction,
+        instance: *LoxInstance,
+    ) RuntimeError!*UserFunction {
+        const env_ptr = instance.alloc.create(Environment) catch {
+            return RuntimeError.OutOfMemory;
+        };
+        env_ptr.* = Environment.init(instance.alloc, self.closure);
+        try env_ptr.define("this", Value{ .instance = instance });
+
+        const bound_fn = instance.alloc.create(UserFunction) catch {
+            return RuntimeError.OutOfMemory;
+        };
+
+        bound_fn.* = UserFunction.init(self.declaration, env_ptr);
+        return bound_fn;
     }
 };
 
@@ -258,7 +291,25 @@ pub const LoxInstance = struct {
 
     pub fn get(self: *LoxInstance, name: Token) RuntimeError!Value {
         if (self.fields.get(name.lexeme)) |value| return value;
+
+        if (self.class.findMethod(name.lexeme)) |method| {
+            const bound = try method.bind(self);
+
+            const callable_ptr = self.alloc.create(LoxCallable) catch {
+                return RuntimeError.OutOfMemory;
+            };
+
+            callable_ptr.* = LoxCallable{ .userFn = bound };
+
+            return Value{ .callable = callable_ptr };
+        }
         return RuntimeError.UndefinedVariable;
+    }
+
+    pub fn set(self: *LoxInstance, name: Token, value: Value) RuntimeError!void {
+        self.fields.put(name.lexeme, value) catch {
+            return RuntimeError.OutOfMemory;
+        };
     }
 
     pub fn toString(self: *const LoxInstance, writer: *std.io.Writer) !void {
@@ -268,21 +319,36 @@ pub const LoxInstance = struct {
 
 pub const LoxClass = struct {
     name: []const u8,
+    methods: std.StringHashMap(*UserFunction),
 
-    pub fn init(name: []const u8) LoxClass {
-        return .{ .name = name };
+    pub fn init(name: []const u8, methods: std.StringHashMap(*UserFunction)) LoxClass {
+        return .{ .name = name, .methods = methods };
     }
     pub fn call(
         self: *LoxClass,
         interpreter: *Interpreter,
-        _: []const Value,
+        args: []const Value,
     ) RuntimeError!?Value {
         const inst_ptr = try interpreter.alloc.create(LoxInstance);
         inst_ptr.* = LoxInstance.init(self, interpreter.alloc);
+
+        if (self.findMethod("init")) |initializer| {
+            const initFn = try initializer.bind(inst_ptr);
+            _ = try initFn.call(interpreter, args);
+        }
+
         return Value{ .instance = inst_ptr };
     }
 
-    pub fn arity(_: *LoxClass) usize {
+    pub fn findMethod(self: *LoxClass, name: []const u8) ?*UserFunction {
+        if (self.methods.get(name)) |method| return method;
+        return null;
+    }
+
+    pub fn arity(self: *LoxClass) usize {
+        if (self.findMethod("init")) |initializer| {
+            return initializer.arity;
+        }
         return 0;
     }
 
@@ -294,7 +360,7 @@ pub const LoxClass = struct {
 // I just learned about this pattern, that is why the other structs don't follow it
 // but it is pretty cool
 pub const LoxCallable = union(enum) {
-    userFn: UserFunction,
+    userFn: *UserFunction,
     nativeFn: NativeFunction,
     class: LoxClass,
 
@@ -312,7 +378,7 @@ pub const LoxCallable = union(enum) {
         args: []const Value,
     ) RuntimeError!?Value {
         return switch (self.*) {
-            .userFn => |*f| try f.call(interpreter, args),
+            .userFn => |f| try f.call(interpreter, args),
             .nativeFn => |*nf| try nf.call(interpreter, args),
             .class => |*c| try c.call(interpreter, args),
         };
@@ -343,6 +409,23 @@ pub fn makeLogical(
     const node = try allocator.create(Expr);
     node.* = Expr{ .Logical = LogicalExpr{ .left = left, .operator = operator, .right = right } };
     return node;
+}
+
+fn makeSet(
+    alloc: std.mem.Allocator,
+    name: Token,
+    value: *Expr,
+    obj: *Expr,
+) !*Expr {
+    const expr = try alloc.create(Expr);
+    expr.* = .{
+        .Set = .{
+            .name = name,
+            .value = value,
+            .obj = obj,
+        },
+    };
+    return expr;
 }
 
 fn makeAssign(
@@ -394,6 +477,12 @@ pub fn makeUnary(
 pub fn makeGrouping(allocator: std.mem.Allocator, expr: *Expr) !*Expr {
     const node = try allocator.create(Expr);
     node.* = Expr{ .Grouping = GroupingExpr{ .expression = expr } };
+    return node;
+}
+
+pub fn makeThis(allocator: std.mem.Allocator, keyword: Token) !*Expr {
+    const node = try allocator.create(Expr);
+    node.* = Expr{ .This = ThisExpr{ .keyword = keyword } };
     return node;
 }
 
@@ -1067,6 +1156,9 @@ pub const Parser = struct {
                 .Variable => |variable| {
                     return try makeAssign(self.alloc, variable.name, value);
                 },
+                .Get => |get| {
+                    return try makeSet(self.alloc, get.name, value, get.obj);
+                },
                 else => {
                     return ParserError.InvalidAssignment;
                 },
@@ -1243,6 +1335,11 @@ pub const Parser = struct {
             return try makeGrouping(self.alloc, expr);
         }
 
+        if (self.match(&[_]TokenType{.THIS})) {
+            const keyword = self.previous();
+            return try makeThis(self.alloc, keyword);
+        }
+
         if (self.isAtEnd()) {
             return ParserError.ExpectedExpression;
         }
@@ -1385,11 +1482,12 @@ pub const Environment = struct {
 
     /// Initializes an environment with a allocator and a optional pointer to a enclosing environment.
     pub fn init(alloc: std.mem.Allocator, enclosing: ?*Environment) Environment {
-        return .{
+        const env = Environment{
             .values = std.StringHashMap(Value).init(alloc),
             .alloc = alloc,
             .enclosing = enclosing,
         };
+        return env;
     }
 
     /// Defines a entry inside of the environment hahsmap.
@@ -1404,12 +1502,8 @@ pub const Environment = struct {
     }
 
     pub fn getAt(self: *Environment, distance: usize, name: []const u8) RuntimeError!Value {
-        if (self.ancestors(distance)) |env| {
-            if (env.values.get(name)) |v| {
-                return v;
-            }
-            return RuntimeError.UndefinedVariable;
-        }
+        const env = self.ancestors(distance) orelse return RuntimeError.UndefinedVariable;
+        if (env.values.get(name)) |v| return v;
         return RuntimeError.UndefinedVariable;
     }
 
@@ -1422,15 +1516,17 @@ pub const Environment = struct {
     }
 
     fn ancestors(self: *Environment, distance: usize) ?*Environment {
-        var enviroment: ?*Environment = self;
+        var env: ?*Environment = self;
 
         for (0..distance) |_| {
-            if (enviroment) |env| {
-                enviroment = env.enclosing;
+            if (env) |e| {
+                env = e.enclosing;
+            } else {
+                return null;
             }
         }
 
-        return enviroment;
+        return env;
     }
 
     // Assigns a variable. This is different from `define` because here we are not creating any new
@@ -1466,7 +1562,6 @@ pub const Environment = struct {
         if (self.enclosing) |env| {
             return env.get(name);
         }
-
         return RuntimeError.UndefinedVariable;
     }
 };
@@ -1478,9 +1573,10 @@ pub const Resolver = struct {
     interpreter: *Interpreter,
     scopes: std.ArrayList(std.StringHashMap(bool)),
     currentFunction: FunctionType = FunctionType.NONE,
+    currentClass: ClassType = ClassType.NONE,
 
     pub fn init(alloc: std.mem.Allocator, interpreter: *Interpreter) !Resolver {
-        return .{ .alloc = alloc, .interpreter = interpreter, .scopes = try std.ArrayList(std.StringHashMap(bool)).initCapacity(alloc, 1048), .currentFunction = FunctionType.NONE };
+        return .{ .alloc = alloc, .interpreter = interpreter, .scopes = try std.ArrayList(std.StringHashMap(bool)).initCapacity(alloc, 1048), .currentFunction = FunctionType.NONE, .currentClass = ClassType.NONE };
     }
 
     pub fn deinit(self: *Resolver) void {
@@ -1543,8 +1639,27 @@ pub const Resolver = struct {
                 self.endScope();
             },
             .class => |c| {
+                const enclosingClass = self.currentClass;
+                self.currentClass = ClassType.CLASS;
+
                 try self.declare(c.name);
                 self.define(c.name);
+
+                try self.beginScope();
+
+                if (self.peekMutable()) |peek| {
+                    peek.*.put("this", true) catch {
+                        return RuntimeError.OutOfMemory;
+                    };
+                }
+
+                for (c.methods) |method| {
+                    const declaration = FunctionType.METHOD;
+                    try self.resolveFunction(method.*, declaration);
+                }
+
+                self.endScope();
+                self.currentClass = enclosingClass;
             },
             .var_decl => |v| try self.visitVarStmt(v),
             .function_decl => |f| try self.visitFunctionStmt(f),
@@ -1567,6 +1682,8 @@ pub const Resolver = struct {
             .Unary => |u| try self.resolveExpr(u.right),
             .Literal => |l| try self.visitLiteralExpr(l),
             .Get => |g| try self.visitGetExpr(g),
+            .Set => |s| try self.visitSetExpr(s),
+            .This => |t| try self.visitThisExpr(expr, t),
         }
     }
 
@@ -1661,6 +1778,18 @@ pub const Resolver = struct {
         try self.resolveExpr(expr.obj);
     }
 
+    fn visitSetExpr(self: *Resolver, expr: SetExpr) RuntimeError!void {
+        try self.resolveExpr(expr.value);
+        try self.resolveExpr(expr.obj);
+    }
+
+    fn visitThisExpr(self: *Resolver, exprPtr: *Expr, expr: ThisExpr) RuntimeError!void {
+        if (self.currentClass == .NONE) {
+            return RuntimeError.InvalidUseOfThis;
+        }
+        self.resolveLocal(exprPtr, expr.keyword);
+    }
+
     fn visitGroupingExpr(self: *Resolver, expr: GroupingExpr) RuntimeError!void {
         try self.resolveExpr(expr.expression);
     }
@@ -1689,7 +1818,9 @@ pub const Interpreter = struct {
     locals: std.AutoHashMap(*Expr, usize),
 
     pub fn init(alloc: std.mem.Allocator, writer: *std.io.Writer) !Interpreter {
-        const globalEnv = try alloc.create(Environment);
+        const globalEnv = alloc.create(Environment) catch {
+            return RuntimeError.OutOfMemory;
+        };
         globalEnv.* = Environment.init(alloc, null);
 
         const clockNativeFn = NativeFunction{ .arity = 0, .func = &clock_fn };
@@ -1731,6 +1862,8 @@ pub const Interpreter = struct {
             .Logical => |logical| try self.visitLogicalExpr(logical),
             .Call => |call| try self.visitCallExpr(call),
             .Get => |get| try self.visitGetExpr(get),
+            .Set => |set| try self.visitSetExpr(set),
+            .This => |this| try self.visitThisExpr(expr, this),
         };
     }
 
@@ -1765,7 +1898,9 @@ pub const Interpreter = struct {
     }
 
     fn visitBlockStmt(self: *Interpreter, stmt: BlockStmt) RuntimeError!void {
-        const env_ptr = try self.alloc.create(Environment);
+        const env_ptr = self.alloc.create(Environment) catch {
+            return RuntimeError.OutOfMemory;
+        };
         env_ptr.* = Environment.init(self.alloc, self.env);
         try self.execBlock(stmt.statements, env_ptr);
     }
@@ -1773,17 +1908,35 @@ pub const Interpreter = struct {
     fn visitClassStmt(self: *Interpreter, stmt: ClassStmt) RuntimeError!void {
         try self.env.define(stmt.name.lexeme, Value{ .nil = {} });
 
+        var methods: std.StringHashMap(*UserFunction) = .init(self.alloc);
+
+        for (stmt.methods) |method| {
+            const function = self.alloc.create(UserFunction) catch {
+                return RuntimeError.OutOfMemory;
+            };
+
+            function.* = UserFunction.init(method, self.env);
+
+            methods.put(method.name.lexeme, function) catch {
+                return RuntimeError.OutOfMemory;
+            };
+        }
+
         const klass_ptr = self.alloc.create(LoxCallable) catch {
             return RuntimeError.OutOfMemory;
         };
-        const klass = LoxClass.init(stmt.name.lexeme);
+
+        const klass = LoxClass.init(stmt.name.lexeme, methods);
         klass_ptr.* = LoxCallable{ .class = klass };
 
         try self.env.assign(stmt.name.lexeme, Value{ .callable = klass_ptr });
     }
 
     fn visitFunctionStmt(self: *Interpreter, stmt: *const FunctionStmt) RuntimeError!void {
-        const function = UserFunction.init(stmt, self.env);
+        const function = self.alloc.create(UserFunction) catch {
+            return RuntimeError.OutOfMemory;
+        };
+        function.* = UserFunction.init(stmt, self.env);
 
         const callable = self.alloc.create(LoxCallable) catch {
             return RuntimeError.OutOfMemory;
@@ -1846,7 +1999,7 @@ pub const Interpreter = struct {
     }
 
     fn visitVarStmt(self: *Interpreter, stmt: VarStmt) RuntimeError!void {
-        var v: Value = Value.nil;
+        var v = Value{ .nil = {} };
         if (stmt.initializer) |expr| {
             v = try self.eval(expr);
         }
@@ -1878,6 +2031,23 @@ pub const Interpreter = struct {
             .boolean => |b| .{ .boolean = b },
             .nil => Value.nil,
         };
+    }
+
+    fn visitSetExpr(self: *Interpreter, expr: SetExpr) RuntimeError!Value {
+        const obj = try self.eval(expr.obj);
+        switch (obj) {
+            .instance => |instance| {
+                const value = try self.eval(expr.value);
+                try instance.set(expr.name, value);
+                return value;
+            },
+            else => {
+                return RuntimeError.InvalidPropertyCall;
+            },
+        }
+    }
+    fn visitThisExpr(self: *Interpreter, exprPtr: *Expr, expr: ThisExpr) RuntimeError!Value {
+        return try self.lookUpVariable(expr.keyword, exprPtr);
     }
 
     fn visitLogicalExpr(self: *Interpreter, expr: LogicalExpr) RuntimeError!Value {
@@ -1976,6 +2146,7 @@ pub const Interpreter = struct {
             else => return RuntimeError.TypeError,
         };
     }
+
     fn visitGetExpr(self: *Interpreter, expr: GetExpr) RuntimeError!Value {
         const obj = try self.eval(expr.obj);
         return switch (obj) {
@@ -1995,7 +2166,9 @@ pub const Interpreter = struct {
     }
 
     pub fn resolve(self: *Interpreter, expr: *Expr, depth: usize) void {
-        _ = self.locals.put(expr, depth) catch {};
+        _ = self.locals.put(expr, depth) catch {
+            std.log.err("Something went wrong while trying to allocate expr: {s}\n", .{@tagName(expr.*)});
+        };
     }
 
     fn concatStrings(
