@@ -1,8 +1,89 @@
-class Foo {
-  init() {
-    print this;
+// --- 1. Basic Variables and Math ---
+var a = 10;
+var b = 20;
+print (a + b) * 2 / 2;
+print "\n";
+
+// --- 2. Control Flow ---
+if (a < b) {
+  print "if success";
+} else {
+  print "if failure";
+}
+print "\n";
+
+var i = 0;
+while (i < 3) {
+  print i;
+  i= i + 1;
+}
+print "\n";
+
+for (var j = 0; j < 2; j = j + 1) {
+  print j;
+}
+print "\n";
+
+// --- 3. Functions and Closures ---
+fn makeCounter() {
+  var count = 0;
+  fn counter() {
+    count = count + 1;
+    return count;
+  }
+  return counter;
+}
+
+var counter = makeCounter();
+print counter();
+print counter();
+print "\n";
+
+// --- 4. Basic Classes and Properties ---
+class Bagel {}
+var bagel = Bagel();
+bagel.topping = "cream cheese";
+print bagel.topping;
+print "\n";
+
+// --- 5. Initializers and 'this' ---
+class Person {
+  init(name) {
+    this.name = name;
+  }
+
+  sayName() {
+    print this.name;
   }
 }
 
-var foo = Foo();
-print foo.init();
+var person = Person("Diego");
+person.sayName();
+print "\n";
+
+// --- 6. Inheritance and 'super' ---
+class A {
+  method() {
+    print "method in A";
+  }
+}
+
+class B < A {
+  method() {
+    print "method in B";
+  }
+
+  test() {
+    super.method();
+  }
+}
+
+class C < B {}
+
+var c = C();
+c.method();
+print "\n";
+c.test();
+print "\n";
+
+print "End of test suite";

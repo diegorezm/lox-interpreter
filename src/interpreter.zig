@@ -156,8 +156,22 @@ pub const GetExpr = struct { obj: *Expr, name: Token };
 pub const SetExpr = struct { obj: *Expr, name: Token, value: *Expr };
 
 pub const ThisExpr = struct { keyword: Token };
+pub const SuperExpr = struct { keyword: Token, method: Token };
 
-pub const Expr = union(enum) { Binary: BinaryExpr, Unary: UnaryExpr, Literal: LiteralExpr, Grouping: GroupingExpr, Variable: VariableExpr, Assign: AssignExpr, Logical: LogicalExpr, Call: CallExpr, Get: GetExpr, Set: SetExpr, This: ThisExpr };
+pub const Expr = union(enum) {
+    Binary: BinaryExpr,
+    Unary: UnaryExpr,
+    Literal: LiteralExpr,
+    Grouping: GroupingExpr,
+    Variable: VariableExpr,
+    Assign: AssignExpr,
+    Logical: LogicalExpr,
+    Call: CallExpr,
+    Get: GetExpr,
+    Set: SetExpr,
+    This: ThisExpr,
+    Super: SuperExpr,
+};
 
 pub const PrintStmt = struct {
     expression: *Expr,
@@ -177,7 +191,7 @@ pub const WhileStmt = struct {
     body: *Stmt,
 };
 
-pub const ClassStmt = struct { name: Token, superclass: ?*VariableExpr, methods: []const *FunctionStmt };
+pub const ClassStmt = struct { name: Token, superclass: ?*Expr, methods: []const *FunctionStmt };
 
 pub const BlockStmt = struct {
     statements: []const *Stmt,
@@ -195,28 +209,72 @@ pub const FunctionStmt = struct {
     body: []const *Stmt,
 };
 
-pub const Stmt = union(enum) { expr: ExprStmt, print: PrintStmt, var_decl: VarStmt, block: BlockStmt, if_decl: IFStmt, while_decl: WhileStmt, function_decl: FunctionStmt, return_stmt: ReturnStmt, class: ClassStmt };
+pub const Stmt = union(enum) {
+    expr: ExprStmt,
+    print: PrintStmt,
+    var_decl: VarStmt,
+    block: BlockStmt,
+    if_decl: IFStmt,
+    while_decl: WhileStmt,
+    function_decl: FunctionStmt,
+    return_stmt: ReturnStmt,
+    class: ClassStmt,
+};
 
 pub const Stmts = std.ArrayList(Stmt);
 
-pub const FunctionType = enum { NONE, FUNCTION, METHOD };
-pub const ClassType = enum { NONE, CLASS };
+pub const FunctionType = enum {
+    NONE,
+    FUNCTION,
+    METHOD,
+    INITIALIZER,
+};
+pub const ClassType = enum {
+    NONE,
+    CLASS,
+    SUBCLASS,
+};
 
-const ParserError = error{ ExpectedExpression, ExpectedRightParen, UnexpectedToken, OutOfMemory, InvalidAssignment, TooManyArguments };
+const ParserError = error{
+    ExpectedExpression,
+    ExpectedRightParen,
+    UnexpectedToken,
+    OutOfMemory,
+    InvalidAssignment,
+    TooManyArguments,
+};
 
-pub const RuntimeError = error{ UndefinedVariable, InvalidOperands, DivisionByZero, OutputError, OutOfMemory, TypeError, TooManyArguments, NotEnoughArguments, InvalidArity, Return, RedeclaredVariable, ReadInOwnInitializer, TopLevelReturn, InvalidPropertyCall, InvalidUseOfThis };
+pub const RuntimeError = error{
+    UndefinedVariable,
+    UndefinedClassMethod,
+    InvalidOperands,
+    InvalidUseOfSuper,
+    DivisionByZero,
+    OutputError,
+    OutOfMemory,
+    TypeError,
+    TooManyArguments,
+    NotEnoughArguments,
+    InvalidArity,
+    Return,
+    RedeclaredVariable,
+    ReadInOwnInitializer,
+    TopLevelReturn,
+    InvalidPropertyCall,
+    InvalidUseOfThis,
+    CannotReturnInitializer,
+    CircularInheritance,
+    SuperclassMustBeClass,
+};
 
 pub const UserFunction = struct {
     arity: usize,
     declaration: *const FunctionStmt,
     closure: *Environment,
+    isInitializer: bool = false,
 
-    pub fn init(declaration: *const FunctionStmt, closure: *Environment) UserFunction {
-        return .{
-            .arity = declaration.params.len,
-            .declaration = declaration,
-            .closure = closure,
-        };
+    pub fn init(declaration: *const FunctionStmt, closure: *Environment, isInitializer: bool) UserFunction {
+        return .{ .arity = declaration.params.len, .declaration = declaration, .closure = closure, .isInitializer = isInitializer };
     }
 
     pub fn call(
@@ -238,6 +296,10 @@ pub const UserFunction = struct {
 
         _ = interpreter.execBlock(self.declaration.body, env) catch |err| switch (err) {
             RuntimeError.Return => {
+                if (self.isInitializer) {
+                    const value = try self.closure.getAt(0, "this");
+                    return value;
+                }
                 const rv = interpreter.returnSignal orelse Value{ .nil = {} };
                 interpreter.returnSignal = null;
                 return rv;
@@ -262,7 +324,7 @@ pub const UserFunction = struct {
             return RuntimeError.OutOfMemory;
         };
 
-        bound_fn.* = UserFunction.init(self.declaration, env_ptr);
+        bound_fn.* = UserFunction.init(self.declaration, env_ptr, self.isInitializer);
         return bound_fn;
     }
 };
@@ -313,16 +375,17 @@ pub const LoxInstance = struct {
     }
 
     pub fn toString(self: *const LoxInstance, writer: *std.io.Writer) !void {
-        try writer.print("<{s} instance>", .{self.class.name});
+        try writer.print("<{s} instance>\n", .{self.class.name});
     }
 };
 
 pub const LoxClass = struct {
     name: []const u8,
     methods: std.StringHashMap(*UserFunction),
+    superclass: ?*LoxClass,
 
-    pub fn init(name: []const u8, methods: std.StringHashMap(*UserFunction)) LoxClass {
-        return .{ .name = name, .methods = methods };
+    pub fn init(name: []const u8, methods: std.StringHashMap(*UserFunction), superclass: ?*LoxClass) LoxClass {
+        return .{ .name = name, .methods = methods, .superclass = superclass };
     }
     pub fn call(
         self: *LoxClass,
@@ -342,6 +405,9 @@ pub const LoxClass = struct {
 
     pub fn findMethod(self: *LoxClass, name: []const u8) ?*UserFunction {
         if (self.methods.get(name)) |method| return method;
+        if (self.superclass) |superclass| {
+            return superclass.findMethod(name);
+        }
         return null;
     }
 
@@ -362,7 +428,7 @@ pub const LoxClass = struct {
 pub const LoxCallable = union(enum) {
     userFn: *UserFunction,
     nativeFn: NativeFunction,
-    class: LoxClass,
+    class: *LoxClass,
 
     pub fn arity(self: *LoxCallable) usize {
         return switch (self.*) {
@@ -380,7 +446,7 @@ pub const LoxCallable = union(enum) {
         return switch (self.*) {
             .userFn => |f| try f.call(interpreter, args),
             .nativeFn => |*nf| try nf.call(interpreter, args),
-            .class => |*c| try c.call(interpreter, args),
+            .class => |c| try c.call(interpreter, args),
         };
     }
 };
@@ -483,6 +549,12 @@ pub fn makeGrouping(allocator: std.mem.Allocator, expr: *Expr) !*Expr {
 pub fn makeThis(allocator: std.mem.Allocator, keyword: Token) !*Expr {
     const node = try allocator.create(Expr);
     node.* = Expr{ .This = ThisExpr{ .keyword = keyword } };
+    return node;
+}
+
+pub fn makeSuper(allocator: std.mem.Allocator, keyword: Token, method: Token) !*Expr {
+    const node = try allocator.create(Expr);
+    node.* = Expr{ .Super = SuperExpr{ .keyword = keyword, .method = method } };
     return node;
 }
 
@@ -690,6 +762,15 @@ pub const Scanner = struct {
 
             ' ', '\r', '\t' => {},
             '\n' => self.line += 1,
+            '/' => {
+                if (self.match('/')) {
+                    while ((self.peek() orelse '\n') != '\n' and !self.isAtEnd()) {
+                        _ = self.advance();
+                    }
+                } else {
+                    try self.addToken(.SLASH, null);
+                }
+            },
 
             else => {
                 if (std.ascii.isDigit(c)) {
@@ -886,6 +967,20 @@ pub const Parser = struct {
 
     fn class(self: *Parser) ParserError!*Stmt {
         const name = try self.consume(.IDENTIFIER, "Expect class name.");
+
+        var superclass: ?*Expr = null;
+
+        if (self.match(&[_]TokenType{.LESS})) {
+            _ = try self.consume(.IDENTIFIER, "Expect superclass name.");
+            const variable_ptr = try self.alloc.create(Expr);
+            variable_ptr.* = Expr{
+                .Variable = VariableExpr{
+                    .name = self.previous(),
+                },
+            };
+            superclass = variable_ptr;
+        }
+
         _ = try self.consume(.LEFT_BRACE, "Expect '{' before class body.");
 
         var methods: std.ArrayList(*FunctionStmt) = .empty;
@@ -903,7 +998,7 @@ pub const Parser = struct {
             return ParserError.OutOfMemory;
         };
 
-        stmt.* = Stmt{ .class = ClassStmt{ .name = name, .methods = methods.items, .superclass = null } };
+        stmt.* = Stmt{ .class = ClassStmt{ .name = name, .methods = methods.items, .superclass = superclass } };
         return stmt;
     }
 
@@ -1335,6 +1430,13 @@ pub const Parser = struct {
             return try makeGrouping(self.alloc, expr);
         }
 
+        if (self.match(&[_]TokenType{.SUPER})) {
+            const keyword = self.previous();
+            _ = try self.consume(.DOT, "Expect '.' after 'super'.");
+            const method = try self.consume(.IDENTIFIER, "Expect superclass method name.");
+            return try makeSuper(self.alloc, keyword, method);
+        }
+
         if (self.match(&[_]TokenType{.THIS})) {
             const keyword = self.previous();
             return try makeThis(self.alloc, keyword);
@@ -1645,6 +1747,23 @@ pub const Resolver = struct {
                 try self.declare(c.name);
                 self.define(c.name);
 
+                if (c.superclass) |super_expr| {
+                    self.currentClass = .SUBCLASS;
+                    switch (super_expr.*) {
+                        .Variable => |v| {
+                            if (std.mem.eql(u8, v.name.lexeme, c.name.lexeme))
+                                return RuntimeError.CircularInheritance;
+
+                            try self.resolveExpr(super_expr);
+                        },
+                        else => return RuntimeError.InvalidPropertyCall,
+                    }
+                    try self.beginScope();
+                    if (self.peekMutable()) |scope| {
+                        try scope.put("super", true);
+                    }
+                }
+
                 try self.beginScope();
 
                 if (self.peekMutable()) |peek| {
@@ -1654,11 +1773,19 @@ pub const Resolver = struct {
                 }
 
                 for (c.methods) |method| {
-                    const declaration = FunctionType.METHOD;
+                    var declaration = FunctionType.METHOD;
+                    if (std.mem.eql(u8, method.name.lexeme, "init")) {
+                        declaration = FunctionType.INITIALIZER;
+                    }
                     try self.resolveFunction(method.*, declaration);
                 }
 
                 self.endScope();
+
+                if (c.superclass != null) {
+                    self.endScope();
+                }
+
                 self.currentClass = enclosingClass;
             },
             .var_decl => |v| try self.visitVarStmt(v),
@@ -1684,6 +1811,7 @@ pub const Resolver = struct {
             .Get => |g| try self.visitGetExpr(g),
             .Set => |s| try self.visitSetExpr(s),
             .This => |t| try self.visitThisExpr(expr, t),
+            .Super => |s| try self.visitSuperExpr(expr, s),
         }
     }
 
@@ -1761,6 +1889,11 @@ pub const Resolver = struct {
         if (self.currentFunction == .NONE) {
             return RuntimeError.TopLevelReturn;
         }
+
+        if (self.currentFunction == .INITIALIZER) {
+            return RuntimeError.CannotReturnInitializer;
+        }
+
         if (stmt.value) |expr| try self.resolveExpr(expr);
     }
 
@@ -1786,6 +1919,16 @@ pub const Resolver = struct {
     fn visitThisExpr(self: *Resolver, exprPtr: *Expr, expr: ThisExpr) RuntimeError!void {
         if (self.currentClass == .NONE) {
             return RuntimeError.InvalidUseOfThis;
+        }
+        self.resolveLocal(exprPtr, expr.keyword);
+    }
+
+    fn visitSuperExpr(self: *Resolver, exprPtr: *Expr, expr: SuperExpr) RuntimeError!void {
+        if (self.currentClass == .NONE) {
+            return RuntimeError.InvalidUseOfSuper;
+        }
+        if (self.currentClass != .SUBCLASS) {
+            return RuntimeError.InvalidUseOfSuper;
         }
         self.resolveLocal(exprPtr, expr.keyword);
     }
@@ -1864,6 +2007,7 @@ pub const Interpreter = struct {
             .Get => |get| try self.visitGetExpr(get),
             .Set => |set| try self.visitSetExpr(set),
             .This => |this| try self.visitThisExpr(expr, this),
+            .Super => |super| try self.visitSuperExpr(expr, super),
         };
     }
 
@@ -1906,7 +2050,32 @@ pub const Interpreter = struct {
     }
 
     fn visitClassStmt(self: *Interpreter, stmt: ClassStmt) RuntimeError!void {
+        var superclass: ?*LoxClass = null;
+
+        if (stmt.superclass) |super_expr| {
+            const value = try self.eval(super_expr);
+            switch (value) {
+                .callable => |callable_ptr| switch (callable_ptr.*) {
+                    .class => |cls| superclass = cls,
+                    else => return RuntimeError.SuperclassMustBeClass,
+                },
+                else => return RuntimeError.SuperclassMustBeClass,
+            }
+        }
+
         try self.env.define(stmt.name.lexeme, Value{ .nil = {} });
+        const previous_env = self.env;
+
+        if (superclass) |sp| {
+            const super_env = try self.alloc.create(Environment);
+            super_env.* = Environment.init(self.alloc, self.env);
+
+            const callable_ptr = try self.alloc.create(LoxCallable);
+            callable_ptr.* = LoxCallable{ .class = sp };
+            try super_env.define("super", Value{ .callable = callable_ptr });
+
+            self.env = super_env;
+        }
 
         var methods: std.StringHashMap(*UserFunction) = .init(self.alloc);
 
@@ -1915,28 +2084,36 @@ pub const Interpreter = struct {
                 return RuntimeError.OutOfMemory;
             };
 
-            function.* = UserFunction.init(method, self.env);
+            function.* = UserFunction.init(method, self.env, std.mem.eql(u8, method.name.lexeme, "init"));
 
             methods.put(method.name.lexeme, function) catch {
                 return RuntimeError.OutOfMemory;
             };
         }
 
-        const klass_ptr = self.alloc.create(LoxCallable) catch {
+        const callable_ptr = self.alloc.create(LoxCallable) catch {
             return RuntimeError.OutOfMemory;
         };
 
-        const klass = LoxClass.init(stmt.name.lexeme, methods);
-        klass_ptr.* = LoxCallable{ .class = klass };
+        const klass_ptr = self.alloc.create(LoxClass) catch {
+            return RuntimeError.OutOfMemory;
+        };
 
-        try self.env.assign(stmt.name.lexeme, Value{ .callable = klass_ptr });
+        klass_ptr.* = LoxClass.init(stmt.name.lexeme, methods, superclass);
+        callable_ptr.* = LoxCallable{ .class = klass_ptr };
+
+        if (stmt.superclass != null) {
+            self.env = previous_env;
+        }
+
+        try self.env.assign(stmt.name.lexeme, Value{ .callable = callable_ptr });
     }
 
     fn visitFunctionStmt(self: *Interpreter, stmt: *const FunctionStmt) RuntimeError!void {
         const function = self.alloc.create(UserFunction) catch {
             return RuntimeError.OutOfMemory;
         };
-        function.* = UserFunction.init(stmt, self.env);
+        function.* = UserFunction.init(stmt, self.env, false);
 
         const callable = self.alloc.create(LoxCallable) catch {
             return RuntimeError.OutOfMemory;
@@ -2046,6 +2223,38 @@ pub const Interpreter = struct {
             },
         }
     }
+
+    fn visitSuperExpr(self: *Interpreter, exprPtr: *Expr, expr: SuperExpr) RuntimeError!Value {
+        const distance = self.locals.get(exprPtr) orelse return RuntimeError.UndefinedVariable;
+
+        const superclassV = try self.env.getAt(distance, "super");
+
+        return switch (superclassV) {
+            .callable => |c| switch (c.*) {
+                .class => |superclass| {
+                    const instanceValue = try self.env.getAt(distance - 1, "this");
+                    const instance = switch (instanceValue) {
+                        .instance => |inst| inst,
+                        else => return RuntimeError.TypeError,
+                    };
+
+                    const method = superclass.findMethod(expr.method.lexeme) orelse return RuntimeError.UndefinedClassMethod;
+
+                    const bound = try method.bind(instance);
+
+                    const callable_ptr = self.alloc.create(LoxCallable) catch {
+                        return RuntimeError.OutOfMemory;
+                    };
+                    callable_ptr.* = LoxCallable{ .userFn = bound };
+
+                    return Value{ .callable = callable_ptr };
+                },
+                else => return RuntimeError.TypeError,
+            },
+            else => return RuntimeError.TypeError,
+        };
+    }
+
     fn visitThisExpr(self: *Interpreter, exprPtr: *Expr, expr: ThisExpr) RuntimeError!Value {
         return try self.lookUpVariable(expr.keyword, exprPtr);
     }
