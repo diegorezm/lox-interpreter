@@ -34,6 +34,12 @@ pub fn main() !void {
     var stdout = std.fs.File.stdout().writer(&buf);
 
     var i = try interpreter.Interpreter.init(arena.allocator(), &stdout.interface);
+    defer i.deinit();
+
+    var resolver = try interpreter.Resolver.init(arena.allocator(), &i);
+    defer resolver.deinit();
+
+    try resolver.resolve(stmts);
     i.interpret(stmts);
 
     try stdout.interface.writeByte('\n');

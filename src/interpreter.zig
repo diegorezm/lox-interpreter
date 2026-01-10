@@ -192,9 +192,11 @@ pub const Stmt = union(enum) { expr: ExprStmt, print: PrintStmt, var_decl: VarSt
 
 pub const Stmts = std.ArrayList(Stmt);
 
+pub const FunctionType = enum { NONE, FUNCTION };
+
 const ParserError = error{ ExpectedExpression, ExpectedRightParen, UnexpectedToken, OutOfMemory, InvalidAssignment, TooManyArguments };
 
-pub const RuntimeError = error{ UndefinedVariable, InvalidOperands, DivisionByZero, OutputError, OutOfMemory, TypeError, TooManyArguments, NotEnoughArguments, InvalidArity, Return };
+pub const RuntimeError = error{ UndefinedVariable, InvalidOperands, DivisionByZero, OutputError, OutOfMemory, TypeError, TooManyArguments, NotEnoughArguments, InvalidArity, Return, RedeclaredVariable, ReadInOwnInitializer, TopLevelReturn };
 
 pub const UserFunction = struct {
     arity: usize,
@@ -1309,6 +1311,36 @@ pub const Environment = struct {
         };
     }
 
+    pub fn getAt(self: *Environment, distance: usize, name: []const u8) RuntimeError!Value {
+        if (self.ancestors(distance)) |env| {
+            if (env.values.get(name)) |v| {
+                return v;
+            }
+            return RuntimeError.UndefinedVariable;
+        }
+        return RuntimeError.UndefinedVariable;
+    }
+
+    pub fn assignAt(self: *Environment, distance: usize, name: []const u8, value: Value) RuntimeError!void {
+        if (self.ancestors(distance)) |env| {
+            try env.values.put(name, value);
+        } else {
+            return RuntimeError.UndefinedVariable;
+        }
+    }
+
+    fn ancestors(self: *Environment, distance: usize) ?*Environment {
+        var enviroment: ?*Environment = self;
+
+        for (0..distance) |_| {
+            if (enviroment) |env| {
+                enviroment = env.enclosing;
+            }
+        }
+
+        return enviroment;
+    }
+
     // Assigns a variable. This is different from `define` because here we are not creating any new
     // entries in the hashmap, only modifying entries that already exists.
     pub fn assign(
@@ -1347,6 +1379,205 @@ pub const Environment = struct {
     }
 };
 
+// Resolves variable references to their static scope declarations.
+// Enables functions to share a single environment instead of creating new ones each call.
+pub const Resolver = struct {
+    alloc: std.mem.Allocator,
+    interpreter: *Interpreter,
+    scopes: std.ArrayList(std.StringHashMap(bool)),
+    currentFunction: FunctionType = FunctionType.NONE,
+
+    pub fn init(alloc: std.mem.Allocator, interpreter: *Interpreter) !Resolver {
+        return .{ .alloc = alloc, .interpreter = interpreter, .scopes = try std.ArrayList(std.StringHashMap(bool)).initCapacity(alloc, 1048), .currentFunction = FunctionType.NONE };
+    }
+
+    pub fn deinit(self: *Resolver) void {
+        for (self.scopes.items) |*scope| scope.deinit();
+        self.scopes.deinit(self.alloc);
+    }
+
+    fn beginScope(self: *Resolver) RuntimeError!void {
+        const scope = std.StringHashMap(bool).init(self.alloc);
+        try self.scopes.append(self.alloc, scope);
+    }
+
+    fn endScope(self: *Resolver) void {
+        if (self.scopes.pop()) |scope| {
+            var s = scope;
+            s.deinit();
+        }
+    }
+
+    fn isEmpty(self: *Resolver) bool {
+        return self.scopes.items.len == 0;
+    }
+
+    fn len(self: *Resolver) usize {
+        return self.scopes.items.len;
+    }
+
+    fn peekMutable(self: *Resolver) ?*std.StringHashMap(bool) {
+        if (self.isEmpty()) return null;
+        return &self.scopes.items[self.scopes.items.len - 1];
+    }
+
+    fn declare(self: *Resolver, name: Token) RuntimeError!void {
+        if (self.isEmpty()) return;
+
+        var scope = self.peekMutable().?;
+        if (scope.contains(name.lexeme)) {
+            return RuntimeError.RedeclaredVariable;
+        }
+        try scope.put(name.lexeme, false);
+    }
+
+    fn define(self: *Resolver, name: Token) void {
+        if (self.isEmpty()) return;
+        var scope = self.peekMutable().?;
+        _ = scope.put(name.lexeme, true) catch {};
+    }
+
+    pub fn resolve(self: *Resolver, stmts: []const *Stmt) RuntimeError!void {
+        for (stmts) |stmt| {
+            try self.resolveStmt(stmt);
+        }
+    }
+
+    fn resolveStmt(self: *Resolver, stmt: *Stmt) RuntimeError!void {
+        switch (stmt.*) {
+            .block => |b| {
+                try self.beginScope();
+                try self.resolve(b.statements);
+                self.endScope();
+            },
+            .var_decl => |v| try self.visitVarStmt(v),
+            .function_decl => |f| try self.visitFunctionStmt(f),
+            .expr => |e| try self.visitExpressionStmt(e),
+            .if_decl => |i| try self.visitIfStmt(i),
+            .while_decl => |w| try self.visitWhileStmt(w),
+            .print => |p| try self.visitPrintStmt(p),
+            .return_stmt => |r| try self.visitReturnStmt(r),
+        }
+    }
+
+    fn resolveExpr(self: *Resolver, expr: *Expr) RuntimeError!void {
+        switch (expr.*) {
+            .Assign => |a| try self.visitAssignExpr(expr, a),
+            .Variable => |v| try self.visitVariableExpr(expr, v),
+            .Binary => |b| try self.visitBinaryExpr(b),
+            .Call => |c| try self.visitCallExpr(c),
+            .Grouping => |g| try self.visitGroupingExpr(g),
+            .Logical => |l| try self.visitLogicalExpr(l),
+            .Unary => |u| try self.resolveExpr(u.right),
+            .Literal => |l| try self.visitLiteralExpr(l),
+        }
+    }
+
+    fn resolveLocal(self: *Resolver, expr: *Expr, name: Token) void {
+        const scopes_len = self.scopes.items.len;
+        var i: usize = scopes_len;
+        while (i > 0) : (i -= 1) {
+            const scope_ref = &self.scopes.items[i - 1];
+            if (scope_ref.contains(name.lexeme)) {
+                const distance = scopes_len - i;
+                self.interpreter.resolve(expr, distance);
+                return;
+            }
+        }
+    }
+
+    fn resolveFunction(self: *Resolver, function: FunctionStmt, functionType: FunctionType) RuntimeError!void {
+        const enclosingFunction = self.currentFunction;
+        self.currentFunction = functionType;
+
+        try self.beginScope();
+        for (function.params) |param| {
+            try self.declare(param);
+            self.define(param);
+        }
+        try self.resolve(function.body);
+        self.endScope();
+
+        self.currentFunction = enclosingFunction;
+    }
+
+    fn visitVarStmt(self: *Resolver, stmt: VarStmt) RuntimeError!void {
+        try self.declare(stmt.name);
+        if (stmt.initializer) |i| try self.resolveExpr(i);
+        self.define(stmt.name);
+    }
+
+    fn visitVariableExpr(self: *Resolver, expr_ptr: *Expr, expr: VariableExpr) RuntimeError!void {
+        if (!self.isEmpty()) {
+            const scope = self.peekMutable().?;
+            if (scope.get(expr.name.lexeme)) |initialized| {
+                if (!initialized) {
+                    return RuntimeError.ReadInOwnInitializer;
+                }
+            }
+        }
+        self.resolveLocal(expr_ptr, expr.name);
+    }
+
+    fn visitAssignExpr(self: *Resolver, expr_ptr: *Expr, expr: AssignExpr) RuntimeError!void {
+        try self.resolveExpr(expr.value);
+        self.resolveLocal(expr_ptr, expr.name);
+    }
+
+    fn visitExpressionStmt(self: *Resolver, stmt: ExprStmt) RuntimeError!void {
+        try self.resolveExpr(stmt.expression);
+    }
+
+    fn visitIfStmt(self: *Resolver, stmt: IFStmt) RuntimeError!void {
+        try self.resolveExpr(stmt.condition);
+        try self.resolveStmt(stmt.thenBranch);
+        if (stmt.elseBranch) |else_branch| try self.resolveStmt(else_branch);
+    }
+
+    fn visitWhileStmt(self: *Resolver, stmt: WhileStmt) RuntimeError!void {
+        try self.resolveExpr(stmt.condition);
+        try self.resolveStmt(stmt.body);
+    }
+
+    fn visitPrintStmt(self: *Resolver, stmt: PrintStmt) RuntimeError!void {
+        try self.resolveExpr(stmt.expression);
+    }
+
+    fn visitReturnStmt(self: *Resolver, stmt: ReturnStmt) RuntimeError!void {
+        if (self.currentFunction == .NONE) {
+            return RuntimeError.TopLevelReturn;
+        }
+        if (stmt.value) |expr| try self.resolveExpr(expr);
+    }
+
+    fn visitBinaryExpr(self: *Resolver, expr: BinaryExpr) RuntimeError!void {
+        try self.resolveExpr(expr.left);
+        try self.resolveExpr(expr.right);
+    }
+
+    fn visitCallExpr(self: *Resolver, expr: CallExpr) RuntimeError!void {
+        try self.resolveExpr(expr.callee);
+        if (expr.arguments) |args| for (args) |arg| try self.resolveExpr(arg);
+    }
+
+    fn visitGroupingExpr(self: *Resolver, expr: GroupingExpr) RuntimeError!void {
+        try self.resolveExpr(expr.expression);
+    }
+
+    fn visitLogicalExpr(self: *Resolver, expr: LogicalExpr) RuntimeError!void {
+        try self.resolveExpr(expr.left);
+        try self.resolveExpr(expr.right);
+    }
+
+    fn visitLiteralExpr(_: *Resolver, _: LiteralExpr) RuntimeError!void {}
+
+    fn visitFunctionStmt(self: *Resolver, stmt: FunctionStmt) RuntimeError!void {
+        try self.declare(stmt.name);
+        self.define(stmt.name);
+        try self.resolveFunction(stmt, FunctionType.FUNCTION);
+    }
+};
+
 /// Executes the AST produced by the `Parser` and evaluates expressions.
 pub const Interpreter = struct {
     alloc: std.mem.Allocator,
@@ -1354,6 +1585,7 @@ pub const Interpreter = struct {
     globalEnv: *Environment,
     env: *Environment,
     returnSignal: ?Value,
+    locals: std.AutoHashMap(*Expr, usize),
 
     pub fn init(alloc: std.mem.Allocator, writer: *std.io.Writer) !Interpreter {
         const globalEnv = try alloc.create(Environment);
@@ -1369,8 +1601,13 @@ pub const Interpreter = struct {
         try globalEnv.define("clock", Value{ .callable = callable });
 
         const env = globalEnv;
+        const locals: std.AutoHashMap(*Expr, usize) = .init(alloc);
 
-        return .{ .alloc = alloc, .writer = writer, .env = env, .globalEnv = globalEnv, .returnSignal = null };
+        return .{ .alloc = alloc, .writer = writer, .env = env, .globalEnv = globalEnv, .returnSignal = null, .locals = locals };
+    }
+
+    pub fn deinit(self: *Interpreter) void {
+        self.locals.deinit();
     }
 
     pub fn interpret(self: *Interpreter, stmts: []const *Stmt) void {
@@ -1388,8 +1625,8 @@ pub const Interpreter = struct {
             .Grouping => |grp| try self.eval(grp.expression),
             .Binary => |binary| try self.visitBinaryExpr(binary),
             .Unary => |unary| try self.visitUnaryExpr(unary),
-            .Variable => |variable| try self.visitVariableExpr(variable),
-            .Assign => |assign| try self.visitAssignExpr(assign),
+            .Variable => |variable| try self.visitVariableExpr(expr, variable),
+            .Assign => |assign| try self.visitAssignExpr(expr, assign),
             .Logical => |logical| try self.visitLogicalExpr(logical),
             .Call => |call| try self.visitCallExpr(call),
         };
@@ -1468,9 +1705,13 @@ pub const Interpreter = struct {
         }
     }
 
-    fn visitAssignExpr(self: *Interpreter, expr: AssignExpr) RuntimeError!Value {
+    fn visitAssignExpr(self: *Interpreter, exprPtr: *Expr, expr: AssignExpr) RuntimeError!Value {
         const value = try self.eval(expr.value);
-        try self.env.assign(expr.name.lexeme, value);
+        if (self.locals.get(exprPtr)) |distance| {
+            try self.env.assignAt(distance, expr.name.lexeme, value);
+        } else {
+            try self.globalEnv.assign(expr.name.lexeme, value);
+        }
         return value;
     }
 
@@ -1498,8 +1739,16 @@ pub const Interpreter = struct {
         }
     }
 
-    fn visitVariableExpr(self: *Interpreter, expr: VariableExpr) RuntimeError!Value {
-        return self.env.get(expr.name.lexeme);
+    fn visitVariableExpr(self: *Interpreter, exprPrt: *Expr, expr: VariableExpr) RuntimeError!Value {
+        return try self.lookUpVariable(expr.name, exprPrt);
+    }
+
+    fn lookUpVariable(self: *Interpreter, name: Token, expr: *Expr) RuntimeError!Value {
+        if (self.locals.get(expr)) |distance| {
+            return try self.env.getAt(distance, name.lexeme);
+        } else {
+            return try self.globalEnv.get(name.lexeme);
+        }
     }
 
     fn visitLiteralExpr(_: *Interpreter, expr: LiteralExpr) RuntimeError!Value {
@@ -1615,6 +1864,10 @@ pub const Interpreter = struct {
             .boolean => |b| b,
             else => true,
         };
+    }
+
+    pub fn resolve(self: *Interpreter, expr: *Expr, depth: usize) void {
+        _ = self.locals.put(expr, depth) catch {};
     }
 
     fn concatStrings(
