@@ -143,16 +143,18 @@ pub const Value = union(enum) {
     boolean: bool,
     string: []const u8,
     callable: *LoxCallable,
+    instance: *LoxInstance,
     nil,
 };
-
-pub const Expr = union(enum) { Binary: BinaryExpr, Unary: UnaryExpr, Literal: LiteralExpr, Grouping: GroupingExpr, Variable: VariableExpr, Assign: AssignExpr, Logical: LogicalExpr, Call: CallExpr };
 
 pub const ExprStmt = struct {
     expression: *Expr,
 };
 
 pub const CallExpr = struct { callee: *Expr, paren: Token, arguments: ?[]*Expr };
+pub const GetExpr = struct { obj: *Expr, name: Token };
+
+pub const Expr = union(enum) { Binary: BinaryExpr, Unary: UnaryExpr, Literal: LiteralExpr, Grouping: GroupingExpr, Variable: VariableExpr, Assign: AssignExpr, Logical: LogicalExpr, Call: CallExpr, Get: GetExpr };
 
 pub const PrintStmt = struct {
     expression: *Expr,
@@ -172,6 +174,8 @@ pub const WhileStmt = struct {
     body: *Stmt,
 };
 
+pub const ClassStmt = struct { name: Token, superclass: ?*VariableExpr, methods: []const *FunctionStmt };
+
 pub const BlockStmt = struct {
     statements: []const *Stmt,
 };
@@ -188,7 +192,7 @@ pub const FunctionStmt = struct {
     body: []const *Stmt,
 };
 
-pub const Stmt = union(enum) { expr: ExprStmt, print: PrintStmt, var_decl: VarStmt, block: BlockStmt, if_decl: IFStmt, while_decl: WhileStmt, function_decl: FunctionStmt, return_stmt: ReturnStmt };
+pub const Stmt = union(enum) { expr: ExprStmt, print: PrintStmt, var_decl: VarStmt, block: BlockStmt, if_decl: IFStmt, while_decl: WhileStmt, function_decl: FunctionStmt, return_stmt: ReturnStmt, class: ClassStmt };
 
 pub const Stmts = std.ArrayList(Stmt);
 
@@ -196,7 +200,7 @@ pub const FunctionType = enum { NONE, FUNCTION };
 
 const ParserError = error{ ExpectedExpression, ExpectedRightParen, UnexpectedToken, OutOfMemory, InvalidAssignment, TooManyArguments };
 
-pub const RuntimeError = error{ UndefinedVariable, InvalidOperands, DivisionByZero, OutputError, OutOfMemory, TypeError, TooManyArguments, NotEnoughArguments, InvalidArity, Return, RedeclaredVariable, ReadInOwnInitializer, TopLevelReturn };
+pub const RuntimeError = error{ UndefinedVariable, InvalidOperands, DivisionByZero, OutputError, OutOfMemory, TypeError, TooManyArguments, NotEnoughArguments, InvalidArity, Return, RedeclaredVariable, ReadInOwnInitializer, TopLevelReturn, InvalidPropertyCall };
 
 pub const UserFunction = struct {
     arity: usize,
@@ -243,16 +247,62 @@ pub const NativeFunction = struct {
     }
 };
 
+pub const LoxInstance = struct {
+    class: *LoxClass,
+    fields: std.StringHashMap(Value),
+    alloc: std.mem.Allocator,
+
+    pub fn init(class: *LoxClass, alloc: std.mem.Allocator) LoxInstance {
+        return .{ .class = class, .alloc = alloc, .fields = std.StringHashMap(Value).init(alloc) };
+    }
+
+    pub fn get(self: *LoxInstance, name: Token) RuntimeError!Value {
+        if (self.fields.get(name.lexeme)) |value| return value;
+        return RuntimeError.UndefinedVariable;
+    }
+
+    pub fn toString(self: *const LoxInstance, writer: *std.io.Writer) !void {
+        try writer.print("<{s} instance>", .{self.class.name});
+    }
+};
+
+pub const LoxClass = struct {
+    name: []const u8,
+
+    pub fn init(name: []const u8) LoxClass {
+        return .{ .name = name };
+    }
+    pub fn call(
+        self: *LoxClass,
+        interpreter: *Interpreter,
+        _: []const Value,
+    ) RuntimeError!?Value {
+        const inst_ptr = try interpreter.alloc.create(LoxInstance);
+        inst_ptr.* = LoxInstance.init(self, interpreter.alloc);
+        return Value{ .instance = inst_ptr };
+    }
+
+    pub fn arity(_: *LoxClass) usize {
+        return 0;
+    }
+
+    pub fn toString(self: *const LoxClass, writer: *std.io.Writer) !void {
+        try writer.print("{s} instance", .{self.name});
+    }
+};
+
 // I just learned about this pattern, that is why the other structs don't follow it
 // but it is pretty cool
 pub const LoxCallable = union(enum) {
     userFn: UserFunction,
     nativeFn: NativeFunction,
+    class: LoxClass,
 
     pub fn arity(self: *LoxCallable) usize {
         return switch (self.*) {
             .userFn => self.userFn.arity,
             .nativeFn => self.nativeFn.arity,
+            .class => self.class.arity(),
         };
     }
 
@@ -264,9 +314,11 @@ pub const LoxCallable = union(enum) {
         return switch (self.*) {
             .userFn => |*f| try f.call(interpreter, args),
             .nativeFn => |*nf| try nf.call(interpreter, args),
+            .class => |*c| try c.call(interpreter, args),
         };
     }
 };
+
 // ----
 
 // ---- Utils ----
@@ -377,6 +429,9 @@ pub fn printValue(value: Value, writer: *std.io.Writer) !void {
         .number => |n| try writer.print("{d}", .{n}),
         .boolean => |b| try writer.print("{}", .{b}),
         .string => |s| try writer.print("{s}", .{s}),
+        .instance => |i| {
+            try i.toString(writer);
+        },
         .callable => |s| {
             switch (s.*) {
                 .nativeFn => |native| {
@@ -384,6 +439,9 @@ pub fn printValue(value: Value, writer: *std.io.Writer) !void {
                 },
                 .userFn => |user| {
                     try writer.print("<fn {s} >", .{user.declaration.name.lexeme});
+                },
+                .class => |c| {
+                    try c.toString(writer);
                 },
             }
         },
@@ -711,6 +769,12 @@ pub const Parser = struct {
     }
 
     fn declaration(self: *Parser) ?*Stmt {
+        if (self.match(&[_]TokenType{.CLASS})) {
+            return self.class() catch {
+                self.sync();
+                return null;
+            };
+        }
         if (self.match(&[_]TokenType{.FN})) {
             return self.function("function") catch {
                 self.sync();
@@ -729,6 +793,29 @@ pub const Parser = struct {
             self.sync();
             return null;
         };
+    }
+
+    fn class(self: *Parser) ParserError!*Stmt {
+        const name = try self.consume(.IDENTIFIER, "Expect class name.");
+        _ = try self.consume(.LEFT_BRACE, "Expect '{' before class body.");
+
+        var methods: std.ArrayList(*FunctionStmt) = .empty;
+
+        while (!self.check(.RIGHT_BRACE) and !self.isAtEnd()) {
+            const func = try self.function("function");
+
+            methods.append(self.alloc, &func.function_decl) catch {
+                return ParserError.OutOfMemory;
+            };
+        }
+        _ = try self.consume(.RIGHT_BRACE, "Expect '}' after class body.");
+
+        const stmt = self.alloc.create(Stmt) catch {
+            return ParserError.OutOfMemory;
+        };
+
+        stmt.* = Stmt{ .class = ClassStmt{ .name = name, .methods = methods.items, .superclass = null } };
+        return stmt;
     }
 
     fn statement(self: *Parser) ParserError!*Stmt {
@@ -1086,6 +1173,11 @@ pub const Parser = struct {
         while (true) {
             if (self.match(&[_]TokenType{.LEFT_PAREN})) {
                 expr = try self.finishCall(expr);
+            } else if (self.match(&[_]TokenType{.DOT})) {
+                const name = try self.consume(.IDENTIFIER, "Expect property name after '.'.");
+                const get_ptr = try self.alloc.create(Expr);
+                get_ptr.* = Expr{ .Get = GetExpr{ .obj = expr, .name = name } };
+                expr = get_ptr;
             } else {
                 break;
             }
@@ -1450,6 +1542,10 @@ pub const Resolver = struct {
                 try self.resolve(b.statements);
                 self.endScope();
             },
+            .class => |c| {
+                try self.declare(c.name);
+                self.define(c.name);
+            },
             .var_decl => |v| try self.visitVarStmt(v),
             .function_decl => |f| try self.visitFunctionStmt(f),
             .expr => |e| try self.visitExpressionStmt(e),
@@ -1470,6 +1566,7 @@ pub const Resolver = struct {
             .Logical => |l| try self.visitLogicalExpr(l),
             .Unary => |u| try self.resolveExpr(u.right),
             .Literal => |l| try self.visitLiteralExpr(l),
+            .Get => |g| try self.visitGetExpr(g),
         }
     }
 
@@ -1560,6 +1657,10 @@ pub const Resolver = struct {
         if (expr.arguments) |args| for (args) |arg| try self.resolveExpr(arg);
     }
 
+    fn visitGetExpr(self: *Resolver, expr: GetExpr) RuntimeError!void {
+        try self.resolveExpr(expr.obj);
+    }
+
     fn visitGroupingExpr(self: *Resolver, expr: GroupingExpr) RuntimeError!void {
         try self.resolveExpr(expr.expression);
     }
@@ -1629,6 +1730,7 @@ pub const Interpreter = struct {
             .Assign => |assign| try self.visitAssignExpr(expr, assign),
             .Logical => |logical| try self.visitLogicalExpr(logical),
             .Call => |call| try self.visitCallExpr(call),
+            .Get => |get| try self.visitGetExpr(get),
         };
     }
 
@@ -1641,6 +1743,7 @@ pub const Interpreter = struct {
             .while_decl => |w| try self.visitWhileStmt(w),
             .if_decl => |i| try self.visitIfStmt(i),
             .block => |b| try self.visitBlockStmt(b),
+            .class => |c| try self.visitClassStmt(c),
             .var_decl => |s| try self.visitVarStmt(s),
             .print => |s| try self.visitPrintStmt(s),
             .return_stmt => |r| try self.visitReturnStmt(r),
@@ -1665,6 +1768,18 @@ pub const Interpreter = struct {
         const env_ptr = try self.alloc.create(Environment);
         env_ptr.* = Environment.init(self.alloc, self.env);
         try self.execBlock(stmt.statements, env_ptr);
+    }
+
+    fn visitClassStmt(self: *Interpreter, stmt: ClassStmt) RuntimeError!void {
+        try self.env.define(stmt.name.lexeme, Value{ .nil = {} });
+
+        const klass_ptr = self.alloc.create(LoxCallable) catch {
+            return RuntimeError.OutOfMemory;
+        };
+        const klass = LoxClass.init(stmt.name.lexeme);
+        klass_ptr.* = LoxCallable{ .class = klass };
+
+        try self.env.assign(stmt.name.lexeme, Value{ .callable = klass_ptr });
     }
 
     fn visitFunctionStmt(self: *Interpreter, stmt: *const FunctionStmt) RuntimeError!void {
@@ -1696,6 +1811,11 @@ pub const Interpreter = struct {
                     return RuntimeError.TypeError;
                 };
                 self.writer.writeAll(escaped) catch {
+                    return RuntimeError.TypeError;
+                };
+            },
+            .instance => |i| {
+                i.toString(self.writer) catch {
                     return RuntimeError.TypeError;
                 };
             },
@@ -1838,12 +1958,11 @@ pub const Interpreter = struct {
         }
 
         return switch (callee) {
-            .callable => |func| {
-                var callable = func.*;
-
+            .callable => |callable| {
                 if (arguments.items.len > callable.arity()) {
                     return RuntimeError.TooManyArguments;
                 }
+
                 if (arguments.items.len < callable.arity()) {
                     return RuntimeError.NotEnoughArguments;
                 }
@@ -1855,6 +1974,15 @@ pub const Interpreter = struct {
                 return Value{ .nil = {} };
             },
             else => return RuntimeError.TypeError,
+        };
+    }
+    fn visitGetExpr(self: *Interpreter, expr: GetExpr) RuntimeError!Value {
+        const obj = try self.eval(expr.obj);
+        return switch (obj) {
+            .instance => |instance_ptr| {
+                return try instance_ptr.get(expr.name);
+            },
+            else => RuntimeError.InvalidPropertyCall,
         };
     }
 
@@ -1900,6 +2028,9 @@ pub const Interpreter = struct {
             .string => |s1| switch (v2) {
                 .string => |s2| std.mem.eql(u8, s1, s2),
                 else => false,
+            },
+            else => {
+                return false;
             },
         };
     }
